@@ -4,6 +4,7 @@
  */
 import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -26,6 +27,7 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -54,6 +56,28 @@ interface VolumeMount {
   hostPath: string;
   containerPath: string;
   readonly: boolean;
+}
+
+/**
+ * Resolve the Ollama host URL for containers.
+ * On WSL2, host.docker.internal points to Windows, not WSL2.
+ * Use the WSL2 eth0 IP so containers reach the WSL-side Ollama.
+ */
+function resolveOllamaHost(): string | null {
+  // Explicit override wins
+  const envVars = readEnvFile(['OLLAMA_HOST']);
+  if (envVars.OLLAMA_HOST) return envVars.OLLAMA_HOST;
+
+  // Only needed on WSL2 where host.docker.internal routes to Windows
+  if (!fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return null;
+
+  const ifaces = os.networkInterfaces();
+  const eth0 = ifaces['eth0'];
+  if (eth0) {
+    const ipv4 = eth0.find((a) => a.family === 'IPv4' && !a.internal);
+    if (ipv4) return `http://${ipv4.address}:11434`;
+  }
+  return null;
 }
 
 function buildVolumeMounts(
@@ -240,6 +264,14 @@ function buildContainerArgs(
 
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
+
+  // Pass OLLAMA_HOST so the MCP server can reach the host's Ollama instance.
+  // On WSL2, host.docker.internal resolves to the Windows host, not WSL2,
+  // so we use the WSL2 network interface IP instead.
+  const ollamaHost = resolveOllamaHost();
+  if (ollamaHost) {
+    args.push('-e', `OLLAMA_HOST=${ollamaHost}`);
+  }
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),

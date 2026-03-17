@@ -427,6 +427,9 @@ async function runQuery(
         ollama: {
           command: 'node',
           args: [path.join(path.dirname(mcpServerPath), 'ollama-mcp-stdio.js')],
+          env: {
+            ...(process.env.OLLAMA_HOST ? { OLLAMA_HOST: process.env.OLLAMA_HOST } : {}),
+          },
         },
       },
       hooks: {
