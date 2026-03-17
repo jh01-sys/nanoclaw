@@ -18,6 +18,7 @@ import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+import { classifyRisk, RiskLevel } from './risk-classifier.js';
 
 interface ContainerInput {
   prompt: string;
@@ -57,6 +58,8 @@ interface SDKUserMessage {
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
+const RED_CONFIRM_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+const IPC_CONFIRM_DIR = '/workspace/ipc/confirm';
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -259,6 +262,147 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
 }
 
 /**
+ * PreToolUse hook: classifies risk and gates dangerous operations.
+ * - Green: allow silently
+ * - Yellow: allow, log with explanation
+ * - Red: block, request user confirmation via IPC, 5-min timeout
+ */
+// Dev group JID for forwarding 🟡 risk events (set by container-runner via env var)
+const ANNIE_DEV_GROUP_JID = process.env.NANOCLAW_CC_BRIDGE_JID || '';
+
+// Batch accumulator — collects yellow lines and flushes after 3s of inactivity
+const yellowEventBatch: string[] = [];
+let yellowFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleYellowFlush(): void {
+  if (yellowFlushTimer) {
+    clearTimeout(yellowFlushTimer);
+  }
+  yellowFlushTimer = setTimeout(() => {
+    yellowFlushTimer = null;
+    if (!ANNIE_DEV_GROUP_JID || yellowEventBatch.length === 0) {
+      yellowEventBatch.length = 0;
+      return;
+    }
+    const text = `🟡 *Annie:*\n${yellowEventBatch.join('\n')}`;
+    yellowEventBatch.length = 0;
+    try {
+      const ipcMsgDir = '/workspace/ipc/messages';
+      fs.mkdirSync(ipcMsgDir, { recursive: true });
+      const id = `annie-yellow-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const tmp = path.join(ipcMsgDir, `${id}.tmp`);
+      const final = path.join(ipcMsgDir, `${id}.json`);
+      fs.writeFileSync(tmp, JSON.stringify({ type: 'message', chatJid: ANNIE_DEV_GROUP_JID, text }));
+      fs.renameSync(tmp, final);
+    } catch { /* ignore IPC write failures */ }
+  }, 3000);
+}
+
+function createPreToolUseHook(mcpServerPath: string, chatJid: string): HookCallback {
+  return async (input, _toolUseId) => {
+    const preToolUse = input as { hook_event_name: string; tool_name: string; tool_input: unknown };
+    const { tool_name, tool_input } = preToolUse;
+    const risk = classifyRisk(tool_name, tool_input);
+
+    if (risk.level === 'green') {
+      return { decision: 'approve' as const };
+    }
+
+    if (risk.level === 'yellow') {
+      log(`[RISK 🟡] ${tool_name}: ${risk.reason}`);
+      // Batch and forward to dev group so Jake can see what Annie is doing
+      if (ANNIE_DEV_GROUP_JID) {
+        yellowEventBatch.push(`🟡 ${tool_name}: ${risk.reason}`);
+        scheduleYellowFlush();
+      }
+      return { decision: 'approve' as const };
+    }
+
+    // Red: request confirmation
+    log(`[RISK 🔴] ${tool_name}: ${risk.reason} — requesting confirmation`);
+
+    // Build a human-readable command summary (not raw JSON)
+    const inputObj = tool_input as Record<string, unknown> | null;
+    let commandSummary: string;
+    if (tool_name === 'Bash') {
+      commandSummary = String(inputObj?.command || '');
+    } else if (tool_name === 'Write' || tool_name === 'Edit') {
+      commandSummary = String(inputObj?.file_path || '');
+    } else {
+      commandSummary = JSON.stringify(tool_input ?? {}).slice(0, 400);
+    }
+
+    const confirmId = `confirm-${Date.now()}`;
+    const confirmMsg = `🔴 *Dangerous action requires confirmation*\n\n` +
+      `Tool: \`${tool_name}\`\n` +
+      `Risk: ${risk.reason}\n\n` +
+      `\`\`\`\n${commandSummary.slice(0, 600)}\n\`\`\`\n\n` +
+      `Reply *YES* to allow or *NO* to cancel _(5 min timeout)_`;
+
+    // Send confirmation request to user via IPC messages directory
+    const ipcMsgDir = '/workspace/ipc/messages';
+    fs.mkdirSync(ipcMsgDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(ipcMsgDir, `${confirmId}.json`),
+      JSON.stringify({ type: 'message', chatJid, text: confirmMsg }),
+    );
+
+    // Write confirm request metadata so the host routes the reply back
+    fs.mkdirSync(IPC_CONFIRM_DIR, { recursive: true });
+    const confirmRequestPath = path.join(IPC_CONFIRM_DIR, `${confirmId}.request`);
+    fs.writeFileSync(confirmRequestPath, JSON.stringify({
+      id: confirmId,
+      tool_name,
+      reason: risk.reason,
+      command: commandSummary.slice(0, 1000),
+      timestamp: Date.now(),
+    }));
+
+    // Poll for confirmation response
+    const confirmResponsePath = path.join(IPC_CONFIRM_DIR, `${confirmId}.response`);
+    const deadline = Date.now() + RED_CONFIRM_TIMEOUT_MS;
+    let confirmed = false;
+
+    while (Date.now() < deadline) {
+      if (fs.existsSync(confirmResponsePath)) {
+        try {
+          const response = JSON.parse(fs.readFileSync(confirmResponsePath, 'utf-8'));
+          confirmed = response.confirmed === true;
+          fs.unlinkSync(confirmResponsePath);
+        } catch { /* ignore parse errors */ }
+        break;
+      }
+      await new Promise(r => setTimeout(r, IPC_POLL_MS));
+    }
+
+    // Clean up request file
+    try { fs.unlinkSync(confirmRequestPath); } catch { /* ignore */ }
+
+    if (confirmed) {
+      log(`[RISK 🔴] ${tool_name}: CONFIRMED by user`);
+      return { decision: 'approve' as const };
+    }
+
+    // Timed out or denied
+    const denyReason = Date.now() >= deadline
+      ? 'Timed out waiting for confirmation (5 minutes)'
+      : 'User denied the action';
+    log(`[RISK 🔴] ${tool_name}: DENIED — ${denyReason}`);
+
+    // Notify user of cancellation
+    fs.writeFileSync(
+      path.join(ipcMsgDir, `${confirmId}-cancelled.json`),
+      JSON.stringify({ type: 'message', chatJid, text: `🔴 Action cancelled: ${denyReason}` }),
+    );
+
+    return {
+      decision: 'block' as const,
+      reason: denyReason,
+    };
+  };
+}
+
+/**
  * Check for _close sentinel.
  */
 function shouldClose(): boolean {
@@ -392,13 +536,29 @@ async function runQuery(
   for await (const message of query({
     prompt: stream,
     options: {
+      model: (() => {
+        // Read model from IPC file (updated per-message by host), fall back to env var
+        try {
+          const m = fs.readFileSync('/workspace/ipc/model', 'utf-8').trim();
+          if (m) { log(`Using model: ${m}`); return m; }
+        } catch { /* ignore */ }
+        return process.env.CLAUDE_MODEL || undefined;
+      })(),
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
-        : undefined,
+      systemPrompt: (() => {
+        // Read current model for system prompt injection
+        let currentModel = process.env.CLAUDE_MODEL || 'unknown';
+        try {
+          const m = fs.readFileSync('/workspace/ipc/model', 'utf-8').trim();
+          if (m) currentModel = m;
+        } catch { /* ignore */ }
+        const modelNote = `\n\nYou are currently running on model: ${currentModel}. When asked what model you are, report this value.`;
+        const extra = (globalClaudeMd || '') + modelNote;
+        return { type: 'preset' as const, preset: 'claude_code' as const, append: extra };
+      })(),
       allowedTools: [
         'Bash',
         'Read', 'Write', 'Edit', 'Glob', 'Grep',
@@ -408,7 +568,10 @@ async function runQuery(
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
         'mcp__nanoclaw__*',
-        'mcp__ollama__*'
+        'mcp__ollama__*',
+        'mcp__hue__*',
+        'mcp__sonos__*',
+        'mcp__samsung_tv__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -431,8 +594,33 @@ async function runQuery(
             ...(process.env.OLLAMA_HOST ? { OLLAMA_HOST: process.env.OLLAMA_HOST } : {}),
           },
         },
+        hue: {
+          command: 'node',
+          args: [path.join(path.dirname(mcpServerPath), 'hue-mcp-stdio.js')],
+          env: {
+            ...(process.env.HUE_BRIDGE_IP ? { HUE_BRIDGE_IP: process.env.HUE_BRIDGE_IP } : {}),
+            ...(process.env.HUE_API_KEY ? { HUE_API_KEY: process.env.HUE_API_KEY } : {}),
+          },
+        },
+        sonos: {
+          command: 'node',
+          args: [path.join(path.dirname(mcpServerPath), 'sonos-mcp-stdio.js')],
+          env: {
+            ...(process.env.SONOS_API_URL ? { SONOS_API_URL: process.env.SONOS_API_URL } : {}),
+          },
+        },
+        samsung_tv: {
+          command: 'node',
+          args: [path.join(path.dirname(mcpServerPath), 'samsung-tv-mcp-stdio.js')],
+          env: {
+            ...(process.env.SAMSUNG_TV_IP ? { SAMSUNG_TV_IP: process.env.SAMSUNG_TV_IP } : {}),
+            // Store token in mounted group dir so it persists across container restarts
+            SAMSUNG_TV_TOKEN_FILE: '/workspace/group/samsung-tv-token.json',
+          },
+        },
       },
       hooks: {
+        PreToolUse: [{ hooks: [createPreToolUseHook(mcpServerPath, containerInput.chatJid)] }],
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
       },
     }
@@ -458,10 +646,16 @@ async function runQuery(
     if (message.type === 'result') {
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+
+      // Extract actual model(s) used from modelUsage
+      const modelUsage = (message as { modelUsage?: Record<string, unknown> }).modelUsage;
+      const modelsUsed = modelUsage ? Object.keys(modelUsage) : [];
+      const modelTag = modelsUsed.length > 0 ? `\n\n🤖 ${modelsUsed.join(', ')}` : '';
+      log(`Result #${resultCount}: subtype=${message.subtype} models=${modelsUsed.join(',') || 'unknown'}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+
       writeOutput({
         status: 'success',
-        result: textResult || null,
+        result: textResult ? textResult + modelTag : null,
         newSessionId
       });
     }
@@ -479,7 +673,7 @@ async function main(): Promise<void> {
     const stdinData = await readStdin();
     containerInput = JSON.parse(stdinData);
     try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
-    log(`Received input for group: ${containerInput.groupFolder}`);
+    log(`Received input for group: ${containerInput.groupFolder}, model: ${process.env.CLAUDE_MODEL || 'default'}`);
   } catch (err) {
     writeOutput({
       status: 'error',
