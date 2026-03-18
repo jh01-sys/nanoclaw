@@ -25,11 +25,15 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import WebSocket from 'ws';
 import fs from 'fs';
+import path from 'path';
 import dgram from 'dgram';
 
 const SAMSUNG_TV_IP = process.env.SAMSUNG_TV_IP || '';
 const SAMSUNG_TV_MAC = process.env.SAMSUNG_TV_MAC || '';
 const TOKEN_FILE = process.env.SAMSUNG_TV_TOKEN_FILE || '/data/samsung-tv-token.json';
+const MESSAGES_DIR = '/workspace/ipc/messages';
+const NANOCLAW_CHAT_JID = process.env.NANOCLAW_CHAT_JID || '';
+const NANOCLAW_GROUP_FOLDER = process.env.NANOCLAW_GROUP_FOLDER || '';
 const APP_NAME = Buffer.from('NanoClaw').toString('base64');
 // Persistent random device ID — avoids TV-side blocks from previous failed pairing attempts.
 function getDeviceId(): string {
@@ -46,6 +50,35 @@ const PAIR_TIMEOUT_MS = 30000;
 
 function log(msg: string): void {
   console.error(`[SAMSUNG] ${msg}`);
+}
+
+/**
+ * Send a Telegram notification to Jake via the IPC messages directory.
+ * Same mechanism as ipc-mcp-stdio.ts send_message tool.
+ */
+function sendTelegramNotification(text: string): void {
+  if (!NANOCLAW_CHAT_JID) {
+    log(`Cannot send notification (no NANOCLAW_CHAT_JID): ${text}`);
+    return;
+  }
+  try {
+    fs.mkdirSync(MESSAGES_DIR, { recursive: true });
+    const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
+    const filepath = path.join(MESSAGES_DIR, filename);
+    const data = {
+      type: 'message',
+      chatJid: NANOCLAW_CHAT_JID,
+      text,
+      groupFolder: NANOCLAW_GROUP_FOLDER,
+      timestamp: new Date().toISOString(),
+    };
+    const tempPath = `${filepath}.tmp`;
+    fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
+    fs.renameSync(tempPath, filepath);
+    log(`Sent Telegram notification: ${text}`);
+  } catch (err) {
+    log(`Failed to send notification: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 function notConfigured(): { content: Array<{ type: 'text'; text: string }>; isError: true } {
@@ -104,25 +137,24 @@ async function isTVReachable(): Promise<boolean> {
 }
 
 // ── Token Persistence ──────────────────────────────────────────────────────────
-
-let cachedToken: string | null | undefined = undefined; // undefined = not yet loaded
+// NOTE: No in-memory cache — always read from disk. This is intentional: the
+// dashboard_server.py also writes this file, and caching here would cause stale
+// token errors if the dashboard updated the file between MCP tool calls.
 
 function loadToken(): string | null {
-  if (cachedToken !== undefined) return cachedToken;
   try {
     const data = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8')) as { token?: string };
-    cachedToken = data.token ?? null;
-    if (cachedToken) log(`Loaded saved token: ${cachedToken}`);
+    const token = data.token ?? null;
+    if (token) log(`Loaded saved token: ${token}`);
+    return token;
   } catch {
-    cachedToken = null;
+    return null;
   }
-  return cachedToken;
 }
 
 function saveToken(token: string): void {
   try {
     fs.writeFileSync(TOKEN_FILE, JSON.stringify({ token }), 'utf8');
-    cachedToken = token;
     log(`Saved pairing token: ${token}`);
   } catch (err) {
     log(`Failed to save token: ${err instanceof Error ? err.message : String(err)}`);
@@ -131,7 +163,6 @@ function saveToken(token: string): void {
 
 function clearToken(): void {
   try { fs.unlinkSync(TOKEN_FILE); } catch { /* ignore */ }
-  cachedToken = null;
   log('Cleared saved token (will re-pair on next connection)');
 }
 
@@ -150,15 +181,27 @@ function tvUrl(overrideToken?: string | null, port: 8001 | 8002 = 8001): string 
 function extractToken(data: unknown): string | null {
   if (!data || typeof data !== 'object') return null;
   const d = data as Record<string, unknown>;
+  // Token can be a string OR a number (Samsung RU-series sends numeric tokens).
+  // Use truthy + String() to handle both. Skip falsy values (0, '', null, undefined).
+  const toStr = (v: unknown): string | null => {
+    if (v === undefined || v === null || v === '' || v === 0) return null;
+    const s = String(v);
+    return s || null;
+  };
   // Some TVs put token directly in data
-  if (typeof d['token'] === 'string' && d['token']) return d['token'];
-  // Others embed it in clients[0].attributes.token or clients[0].token
+  const direct = toStr(d['token']);
+  if (direct) return direct;
+  // Others embed it in clients[0].token or clients[0].attributes.token
   const clients = d['clients'];
   if (Array.isArray(clients) && clients.length > 0) {
     const client = clients[0] as Record<string, unknown>;
-    if (typeof client['token'] === 'string' && client['token']) return client['token'];
+    const clientTok = toStr(client['token']);
+    if (clientTok) return clientTok;
     const attrs = client['attributes'] as Record<string, unknown> | undefined;
-    if (attrs && typeof attrs['token'] === 'string' && attrs['token']) return attrs['token'];
+    if (attrs) {
+      const attrTok = toStr(attrs['token']);
+      if (attrTok) return attrTok;
+    }
   }
   return null;
 }
@@ -221,8 +264,14 @@ async function connectTVPort(
           if (settled) return;
           settled = true;
           clearTimeout(timer);
+          // Log raw data so we can diagnose token format issues (string vs number)
+          log(`ms.channel.connect data: ${JSON.stringify(msg.data)}`);
           const token = extractToken(msg.data);
-          if (token) saveToken(token);
+          if (token) {
+            saveToken(token);
+          } else {
+            log('No token found in ms.channel.connect — existing token (if any) kept');
+          }
           resolve({ ws: ws as WebSocket, token });
         } else if (msg.event === 'ms.channel.unauthorized') {
           // Don't clear token here — we may fall back to port 8002 and still need it.
@@ -259,26 +308,39 @@ async function connectTV(
   const result8002 = await connectTVPort(portTimeout, noToken, 8002);
   if (!('error' in result8002)) return result8002;
 
-  // Only clear a saved token when the TV explicitly rejected it (ms.channel.unauthorized
-  // on both ports). Timeouts and connection errors mean the TV is unreachable — the token
-  // is still valid and should be kept so it works again when the TV comes back online.
-  const unauthorizedOnBoth = result8001.unauthorized && result8002.unauthorized;
-  if (unauthorizedOnBoth) {
+  // When the TV explicitly rejects our token (ms.channel.unauthorized), do NOT attempt a
+  // silent tokenless reconnect.  Every tokenless connection attempt generates a popup on
+  // the TV screen; if that popup times out or gets denied (even once), the device is moved
+  // to the TV's Blocked list — requiring manual intervention from the TV menu.
+  // The correct response is to clear the stale token, notify Jake, and wait for an
+  // explicit re-pair via samsung_tv_pair.  No automatic retry loops.
+  const unauthorizedOnAny = result8001.unauthorized === true || result8002.unauthorized === true;
+  if (unauthorizedOnAny && !noToken) {
+    log('ms.channel.unauthorized — token expired/rotated, clearing and requesting re-pair');
+    clearToken();
+    sendTelegramNotification(
+      '📺 Samsung TV token expired — run `samsung_tv_pair` and press OK on the TV remote when the approval prompt appears.',
+    );
     return {
       error:
-        'TV rejected connection with ms.channel.unauthorized on both port 8001 and 8002.\n\n'
-        + 'Most likely cause: the TV has this device in its BLOCKED list from a previous\n'
-        + 'rejected attempt. Even with Access Notification = First Time Only, blocked devices\n'
-        + 'never get a prompt again.\n\n'
-        + 'Fix:\n'
-        + '1. On the TV: Settings → General → External Device Manager → Device List\n'
-        + '   Find "nanoclaw" (or similar) and DELETE it.\n'
-        + '2. Then run samsung_tv_pair — the approval prompt should now appear.\n\n'
-        + 'If Device List is empty or nanoclaw is not there, try:\n'
-        + '   Settings → General → External Device Manager → Device Connection Manager\n'
-        + '   → Set Access Notification to "Always" temporarily, pair, then set back.',
+        'Samsung TV token expired (ms.channel.unauthorized).\n\n'
+        + 'A re-pair notification has been sent. Run samsung_tv_pair and press OK on the TV remote when the prompt appears.\n\n'
+        + 'If no prompt appears, the device may already be blocked:\n'
+        + 'Settings → General → External Device Manager → Device List → delete "nanoclaw" → then run samsung_tv_pair.',
     };
   }
+
+  if (unauthorizedOnAny) {
+    // noToken=true path: TV rejected our connection even without a token (blocked device)
+    return {
+      error:
+        'TV rejected connection with ms.channel.unauthorized.\n\n'
+        + 'Device is in the TV\'s BLOCKED list. Fix:\n'
+        + '1. Settings → General → External Device Manager → Device List → delete "nanoclaw".\n'
+        + '2. Then run samsung_tv_pair.',
+    };
+  }
+
   return {
     error: `Port 8001: ${result8001.error}\nPort 8002: ${result8002.error}`,
   };
@@ -341,12 +403,22 @@ server.tool(
   async () => {
     if (!SAMSUNG_TV_IP) return notConfigured();
     log('Starting pairing — waiting up to 30s for TV approval...');
+    // Notify Jake before the 30s window opens
+    sendTelegramNotification(
+      '📺 Samsung TV pairing started — a prompt should appear on the TV screen NOW. Press OK on the TV remote within 30 seconds.',
+    );
     const result = await connectTV(PAIR_TIMEOUT_MS, true);
+    // Debug: log what the TV actually returned
+    log(`Pairing result token: ${JSON.stringify('token' in result ? result.token : 'error')}`);
     if ('error' in result) {
       return {
         content: [{ type: 'text' as const, text: result.error }],
         isError: true,
       };
+    }
+    if (!('error' in result)) {
+      const tokenMsg = result.token ? `Token saved: ${result.token}` : 'No token returned by TV';
+      sendTelegramNotification(`📺 Samsung TV pairing complete. ${tokenMsg}`);
     }
     try { result.ws.close(); } catch { /* ignore */ }
     const msg = result.token
@@ -361,7 +433,7 @@ server.tool(
 
 server.tool(
   'samsung_tv_power',
-  'Toggle Samsung TV power on or off. On 2016+ models KEY_POWERON/KEY_POWEROFF are not supported — all actions send KEY_POWER (toggle). For action=on: if the TV is in deep standby and unreachable, a Wake-on-LAN magic packet is sent first (requires SAMSUNG_TV_MAC env var), then KEY_POWER after a 3-second wake delay.',
+  'Toggle Samsung TV power on or off. On 2016+ models KEY_POWERON/KEY_POWEROFF are not supported — all actions send KEY_POWER (toggle). For action=on: if the TV is in deep standby and unreachable, a Wake-on-LAN magic packet is sent first (requires SAMSUNG_TV_MAC env var), then KEY_POWER after a 3-second wake delay. If the TV rejects the connection (token expired), re-pairing is automatic — a notification is sent to Jake to press OK on the TV remote.',
   {
     action: z.enum(['toggle', 'on', 'off']).describe('Power action: toggle, on, or off (all send KEY_POWER on 2016+ models)'),
   },

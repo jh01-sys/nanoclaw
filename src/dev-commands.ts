@@ -7,7 +7,14 @@ import fs from 'fs';
 import path from 'path';
 
 import { logger } from './logger.js';
-import { scheduleFade, cancelFade, getFadeStatus } from './hue-scheduler.js';
+import {
+  scheduleFade,
+  cancelFade,
+  getFadeStatus,
+  addHueSchedule,
+  listHueSchedules,
+  cancelHueSchedule,
+} from './hue-scheduler.js';
 
 const PROJECT_ROOT = process.cwd();
 const PLAN_PATHS = [
@@ -36,7 +43,9 @@ export function isDevCommand(content: string): boolean {
     cmd === '/merge' ||
     cmd === '/branch' ||
     cmd === '/fade' ||
-    cmd.startsWith('/fade ')
+    cmd.startsWith('/fade ') ||
+    cmd === '/schedule' ||
+    cmd.startsWith('/schedule ')
   );
 }
 
@@ -62,6 +71,8 @@ export async function handleDevCommand(content: string): Promise<string> {
     if (cmd === '/branch') return await cmdBranch();
     if (cmd === '/fade' || cmd.startsWith('/fade '))
       return await cmdFade(trimmed);
+    if (cmd === '/schedule' || cmd.startsWith('/schedule '))
+      return cmdSchedule(trimmed);
     return `Unknown command: ${trimmed}`;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -415,6 +426,57 @@ async function cmdFade(input: string): Promise<string> {
   }
 
   return await scheduleFade(room, duration, params.time);
+}
+
+function cmdSchedule(input: string): string {
+  // Strip leading /schedule and normalize
+  const rest = input.replace(/^\/schedule\s*/i, '').trim();
+
+  // /schedule hue ...
+  if (!rest.startsWith('hue')) {
+    return [
+      'Usage:',
+      '  `/schedule hue 22:00 dim 20%` — dim Olohuone to 20% daily at 22:00',
+      '  `/schedule hue 23:30 off` — turn off lights at 23:30',
+      '  `/schedule hue on 07:00` — turn on lights at 07:00',
+      '  `/schedule hue list` — show active schedules',
+      '  `/schedule hue cancel <id>` — cancel a schedule',
+    ].join('\n');
+  }
+
+  const args = rest.replace(/^hue\s*/i, '').trim().toLowerCase();
+
+  if (!args || args === 'list') return listHueSchedules();
+
+  if (args.startsWith('cancel ')) {
+    const id = args.slice('cancel '.length).trim();
+    if (!id) return 'Usage: /schedule hue cancel <id>';
+    return cancelHueSchedule(id);
+  }
+
+  // Parse: <time> <action> [brightness%]
+  // Examples: "22:00 dim 20%"  "23:30 off"  "07:00 on"
+  const tokens = args.split(/\s+/);
+  if (tokens.length < 2) {
+    return 'Usage: /schedule hue <time> <action> [brightness%]\nExample: /schedule hue 22:00 dim 20%';
+  }
+
+  const time = tokens[0];
+  const action = tokens[1] as 'dim' | 'on' | 'off';
+  if (!['dim', 'on', 'off'].includes(action)) {
+    return `Unknown action "${action}". Use: dim, on, off`;
+  }
+
+  let brightness: number | undefined;
+  if (action === 'dim') {
+    if (tokens.length < 3) return 'Usage: /schedule hue <time> dim <brightness%>';
+    brightness = parseInt(tokens[2].replace('%', ''), 10);
+    if (isNaN(brightness) || brightness < 1 || brightness > 100) {
+      return 'Brightness must be 1–100 (e.g. 20 or 20%).';
+    }
+  }
+
+  return addHueSchedule(time, action, brightness);
 }
 
 // --- Helpers ---

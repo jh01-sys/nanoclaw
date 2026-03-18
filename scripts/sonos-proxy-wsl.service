@@ -1,0 +1,27 @@
+# sonos-proxy-wsl.service
+# Systemd user service that updates the Windows netsh portproxy rule on WSL boot.
+# Ensures node-sonos-http-api on WSL2 is reachable from Windows/LAN after reboot.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp scripts/sonos-proxy-wsl.service ~/.config/systemd/user/
+#   systemctl --user enable sonos-proxy-wsl.service
+#   systemctl --user start sonos-proxy-wsl.service
+#
+# The service runs once at login (after network is up) and updates the portproxy rule.
+
+[Unit]
+Description=Update Windows portproxy rule for Sonos WSL2 bridge
+After=network-online.target
+Wants=network-online.target
+Before=nanoclaw.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/jake/nanoclaw/scripts/sonos-proxy-update.sh
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

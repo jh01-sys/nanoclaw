@@ -19,15 +19,19 @@ import path from 'path';
 import { DATA_DIR } from './config.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
+import { InlineButton } from './types.js';
 
 const CC_EVENTS_DIR = path.join(DATA_DIR, 'ipc', 'cc-events');
 const CC_CONFIRM_DIR = path.join(DATA_DIR, 'ipc', 'cc-confirm');
 const CC_INBOX_DIR = path.join(DATA_DIR, 'ipc', 'cc-inbox');
+const ISSUES_FILE = path.join(process.cwd(), 'groups', 'telegram_main', 'issues.md');
 const POLL_INTERVAL_MS = 1000;
 
 export interface CcBridgeDeps {
-  /** Send a message to a Telegram JID */
+  /** Send a plain message to a Telegram JID */
   sendMessage: (jid: string, text: string) => Promise<void>;
+  /** Send a message with inline keyboard buttons (falls back to plain sendMessage) */
+  sendMessageWithButtons?: (jid: string, text: string, buttons: InlineButton[]) => Promise<void>;
   /** Returns the configured Dev group JID, or null if not configured */
   devGroupJid: () => string | null;
   /** Store a CC response in the DB so Annie sees it as context in her next session */
@@ -144,21 +148,27 @@ async function sendConfirmRequest(
     ``,
     `\`${event.summary}\``,
     ``,
-    `Reply *YES* to allow or *NO* to cancel`,
     `_(5 min timeout — no reply = blocked)_`,
   ].join('\n');
 
-  await deps
-    .sendMessage(devJid, text)
-    .catch((err) =>
-      logger.warn({ err }, 'CC bridge: failed to send confirmation request'),
-    );
+  const buttons: InlineButton[] = [
+    { text: '✅ YES — allow', callbackData: `confirm_yes_${event.id}` },
+    { text: '❌ NO — cancel', callbackData: `confirm_no_${event.id}` },
+  ];
+
+  await (deps.sendMessageWithButtons
+    ? deps.sendMessageWithButtons(devJid, text, buttons)
+    : deps.sendMessage(devJid, text + '\n\nReply *YES* to allow or *NO* to cancel')
+  ).catch((err) =>
+    logger.warn({ err }, 'CC bridge: failed to send confirmation request'),
+  );
 }
 
 interface CcInboxResponse {
   id: string;
   chatJid: string;
   result: string;
+  outcome?: string;
 }
 
 /**
@@ -181,7 +191,6 @@ async function pollInboxResponses(deps: CcBridgeDeps): Promise<void> {
     let response: CcInboxResponse;
     try {
       response = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-      fs.unlinkSync(filePath);
     } catch (err) {
       logger.warn({ file, err }, 'CC inbox: error reading response');
       try {
@@ -190,11 +199,34 @@ async function pollInboxResponses(deps: CcBridgeDeps): Promise<void> {
       continue;
     }
 
-    // Clean up the corresponding .task file
+    // Write a durable .done marker BEFORE deleting .response so cc-task-tracker
+    // can pick up the completion even after the bridge has consumed the .response.
+    const doneFile = path.join(CC_INBOX_DIR, file.replace('.response', '.done'));
+    try {
+      if (!fs.existsSync(doneFile)) {
+        fs.writeFileSync(
+          doneFile,
+          JSON.stringify({ result: response.result?.slice(0, 400) ?? '' }),
+        );
+      }
+    } catch {}
+
+    try {
+      fs.unlinkSync(filePath);
+    } catch {}
+
+    // Read the .task file before deleting it (for issue tracking)
     const taskFile = path.join(
       CC_INBOX_DIR,
       file.replace('.response', '.task'),
     );
+    let taskTitle: string | undefined;
+    let taskBody: string | undefined;
+    try {
+      const taskData = JSON.parse(fs.readFileSync(taskFile, 'utf-8'));
+      taskTitle = taskData.title;
+      taskBody = taskData.body;
+    } catch {}
     try {
       fs.unlinkSync(taskFile);
     } catch {}
@@ -202,6 +234,24 @@ async function pollInboxResponses(deps: CcBridgeDeps): Promise<void> {
     if (!response.chatJid || !response.result) {
       logger.warn({ file }, 'CC inbox: malformed response, skipping');
       continue;
+    }
+
+    // Suppress noisy system messages (superseded/duplicate task notifications)
+    const preview = response.result.slice(0, 50);
+    if (/^(Superseded|Duplicate of)/i.test(preview)) {
+      logger.info({ id: response.id }, 'CC inbox: suppressed superseded/duplicate response');
+      continue;
+    }
+
+    // Notify dev group when a task explicitly reports an error outcome
+    if (response.outcome === 'error') {
+      const devJid = deps.devGroupJid();
+      if (devJid) {
+        const label = taskTitle ?? response.id;
+        await deps
+          .sendMessage(devJid, `❌ CC task failed: ${label}`)
+          .catch((err) => logger.warn({ err }, 'CC inbox: failed to send error notification'));
+      }
     }
 
     // Strip prefix if the subprocess already added it (avoids "⚙️ *CC:* ⚙️ *CC:*")
@@ -223,6 +273,15 @@ async function pollInboxResponses(deps: CcBridgeDeps): Promise<void> {
       { id: response.id, chatJid: response.chatJid },
       'CC inbox: response delivered',
     );
+
+    // Auto-track bug/fix tasks in issues.md
+    if (taskTitle && /\b(fix|bug|broken)\b/i.test(taskTitle)) {
+      try {
+        appendIssueEntry(taskTitle, response.result, taskBody);
+      } catch (err) {
+        logger.warn({ err }, 'CC inbox: failed to append issue entry');
+      }
+    }
   }
 }
 
@@ -280,6 +339,70 @@ export function createCcTaskFromMessage(
     'CC bridge: auto-created task from direct message',
   );
   return id;
+}
+
+/**
+ * Handle a confirmation via inline button callback (confirm_yes_* / confirm_no_*).
+ * Writes the response file that the hook is polling for.
+ * Returns true if a pending request was found and answered.
+ */
+export function handleCcConfirmationCallback(
+  confirmId: string,
+  approved: boolean,
+): boolean {
+  const requestPath = path.join(CC_CONFIRM_DIR, `${confirmId}.request`);
+  if (!fs.existsSync(requestPath)) return false;
+
+  const responsePath = path.join(CC_CONFIRM_DIR, `${confirmId}.response`);
+  try {
+    fs.writeFileSync(responsePath, JSON.stringify({ confirmed: approved }));
+    logger.info(
+      { confirmId, approved },
+      `CC confirmation ${approved ? 'approved' : 'denied'} via button`,
+    );
+    return true;
+  } catch (err) {
+    logger.warn(
+      { confirmId, err },
+      'CC bridge: failed to write confirm response via button',
+    );
+    return false;
+  }
+}
+
+/**
+ * Append a fix entry to issues.md after CC completes a bug/fix task.
+ */
+function appendIssueEntry(title: string, result: string, _body?: string): void {
+  const date = new Date().toISOString().slice(0, 10);
+  // Extract "root cause" line from result if present
+  const rootCauseLine = result
+    .split('\n')
+    .find((l) => /root cause/i.test(l))
+    ?.trim();
+
+  // Build a brief description from the result (first non-empty line, max 200 chars)
+  const brief = result
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => l.length > 10 && !l.startsWith('⚙️'))
+    ?.slice(0, 200);
+
+  const entry = [
+    ``,
+    `## ✅ ${title}`,
+    `**Fixed:** ${date}`,
+    brief ? `**What was done:** ${brief}` : '',
+    rootCauseLine ? `**Root cause:** ${rootCauseLine}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  let existing = '';
+  try {
+    existing = fs.readFileSync(ISSUES_FILE, 'utf-8');
+  } catch {}
+  fs.writeFileSync(ISSUES_FILE, existing + '\n' + entry + '\n');
 }
 
 /**

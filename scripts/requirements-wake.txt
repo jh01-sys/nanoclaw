@@ -1,0 +1,11 @@
+# Wake word detection dependencies
+# Install: pip install --break-system-packages -r requirements-wake.txt
+#
+# NOTE: soundcard is used instead of sounddevice for WSL2 compatibility.
+# soundcard uses PulseAudio natively (libpulse0) — no PortAudio/libportaudio2 needed.
+# sounddevice requires libportaudio2 (sudo apt install libportaudio2) which is an alternative.
+
+openwakeword>=0.4.0
+soundcard>=0.4.5
+numpy>=1.24.0
+scipy>=1.10.0

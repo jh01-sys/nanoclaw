@@ -43,6 +43,11 @@ Single Node.js process with skill-based channel system. Channels (WhatsApp, Tele
 | `/qodo-pr-resolver` | Fetch and fix Qodo PR review issues interactively or in batch |
 | `/get-qodo-rules` | Load org- and repo-level coding rules from Qodo before code tasks |
 
+## CC Scratchpad
+
+Read `data/cc-notes.md` at the start of every session. Append new learnings at end (dated, max 5 lines per session). Trim to 200 lines if over.
+Format: `### YYYY-MM-DD\n- learning`
+
 ## CC Inbox (Tasks from the Bot)
 
 At the start of every conversation, check `data/ipc/cc-inbox/` for pending `.task` files from the bot:

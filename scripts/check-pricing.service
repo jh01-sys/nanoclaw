@@ -1,0 +1,14 @@
+[Unit]
+Description=NanoClaw Anthropic pricing verification
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/nanoclaw
+ExecStart=/usr/bin/node scripts/check-pricing.mjs
+StandardOutput=append:/tmp/pricing-check.log
+StandardError=append:/tmp/pricing-check.log
+
+[Install]
+WantedBy=multi-user.target

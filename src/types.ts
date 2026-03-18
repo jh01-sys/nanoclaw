@@ -79,10 +79,17 @@ export interface TaskRunLog {
 
 // --- Channel abstraction ---
 
+export interface InlineButton {
+  text: string;
+  callbackData: string;
+}
+
 export interface Channel {
   name: string;
   connect(): Promise<void>;
   sendMessage(jid: string, text: string): Promise<void>;
+  // Optional: send message with inline keyboard buttons (Telegram only for now).
+  sendMessageWithButtons?(jid: string, text: string, buttons: InlineButton[]): Promise<void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;

@@ -38,9 +38,9 @@ const recentCompletions: {
   outcome: 'ok' | 'error';
 }[] = [];
 const CLAUDE_BIN = '/home/jake/.npm-global/bin/claude';
-const POLL_INTERVAL_MS = 2000;
+const POLL_INTERVAL_MS = parseInt(process.env.CC_POLL_MS || '500', 10);
 
-const MAX_CLAUDE_WORKERS = parseInt(process.env.CC_MAX_WORKERS || '2', 10);
+const MAX_CLAUDE_WORKERS = parseInt(process.env.CC_MAX_WORKERS || '4', 10);
 const SESSION_TIMEOUT_MS = parseInt(
   process.env.CC_TIMEOUT_MS || String(8 * 60 * 1000),
   10,
@@ -294,6 +294,23 @@ function dispatchClaude(
     deps.storeCcMessage(task.chatJid, errMsg);
   }, SESSION_TIMEOUT_MS);
 
+  // Keep typing indicator alive (Telegram expires it after ~5s)
+  let typingInterval: ReturnType<typeof setInterval> | undefined;
+  if (deps.setTyping) {
+    deps.setTyping(task.chatJid, true).catch(() => {});
+    typingInterval = setInterval(() => {
+      deps.setTyping!(task.chatJid, true).catch(() => {});
+    }, 4000);
+  }
+
+  const clearTyping = () => {
+    if (typingInterval) {
+      clearInterval(typingInterval);
+      typingInterval = undefined;
+    }
+    deps.setTyping?.(task.chatJid, false).catch(() => {});
+  };
+
   const session: RunningSession = {
     proc,
     timer,
@@ -312,6 +329,7 @@ function dispatchClaude(
   });
 
   proc.on('error', async (err) => {
+    clearTyping();
     clearTimeout(timer);
     const startedAt = runningSessions.get(task.id)?.startedAt ?? Date.now();
     runningSessions.delete(task.id);
@@ -334,6 +352,7 @@ function dispatchClaude(
   });
 
   proc.on('close', (code) => {
+    clearTyping();
     clearTimeout(timer);
     const startedAt = runningSessions.get(task.id)?.startedAt ?? Date.now();
     runningSessions.delete(task.id);
@@ -367,6 +386,7 @@ export interface CcWorkerDeps {
     messageId: number,
     emoji: string,
   ) => Promise<void>;
+  setTyping?: (jid: string, isTyping: boolean) => Promise<void>;
 }
 
 async function checkAndDispatch(deps: CcWorkerDeps): Promise<void> {
@@ -449,6 +469,9 @@ async function checkAndDispatch(deps: CcWorkerDeps): Promise<void> {
 }
 
 export function startCcWorker(deps: CcWorkerDeps): void {
+  // Reset status file on startup — clears stale idle:false left by a previous run
+  writeCcStatus();
+
   const poll = async () => {
     try {
       await checkAndDispatch(deps);

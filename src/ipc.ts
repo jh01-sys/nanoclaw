@@ -5,6 +5,7 @@ import { CronExpressionParser } from 'cron-parser';
 
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
+import { InlineButton } from './types.js';
 import {
   createTask,
   deleteTask,
@@ -18,7 +19,12 @@ import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
-  sendReaction?: (jid: string, messageId: number, emoji: string) => Promise<void>;
+  sendMessageWithButtons?: (jid: string, text: string, buttons: InlineButton[]) => Promise<void>;
+  sendReaction?: (
+    jid: string,
+    messageId: number,
+    emoji: string,
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -80,13 +86,37 @@ export function startIpcWatcher(deps: IpcDeps): void {
             const filePath = path.join(messagesDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'reaction' && data.chatJid && data.messageId && data.emoji && deps.sendReaction) {
+              if (
+                data.type === 'reaction' &&
+                data.chatJid &&
+                data.messageId &&
+                data.emoji &&
+                deps.sendReaction
+              ) {
                 const targetGroup = registeredGroups[data.chatJid];
-                if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
-                  await deps.sendReaction(data.chatJid, Number(data.messageId), data.emoji);
-                  logger.info({ chatJid: data.chatJid, messageId: data.messageId, emoji: data.emoji, sourceGroup }, 'IPC reaction sent');
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  await deps.sendReaction(
+                    data.chatJid,
+                    Number(data.messageId),
+                    data.emoji,
+                  );
+                  logger.info(
+                    {
+                      chatJid: data.chatJid,
+                      messageId: data.messageId,
+                      emoji: data.emoji,
+                      sourceGroup,
+                    },
+                    'IPC reaction sent',
+                  );
                 } else {
-                  logger.warn({ chatJid: data.chatJid, sourceGroup }, 'Unauthorized IPC reaction attempt blocked');
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC reaction attempt blocked',
+                  );
                 }
               } else if (data.type === 'message' && data.chatJid && data.text) {
                 // Authorization: verify this group can send to this chatJid
@@ -95,7 +125,11 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  if (data.buttons && Array.isArray(data.buttons) && deps.sendMessageWithButtons) {
+                    await deps.sendMessageWithButtons(data.chatJid, data.text, data.buttons);
+                  } else {
+                    await deps.sendMessage(data.chatJid, data.text);
+                  }
                   const senderName = data.sender || sourceGroup;
                   storeMessageDirect({
                     id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,

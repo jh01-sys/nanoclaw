@@ -1,0 +1,18 @@
+[Unit]
+Description=NanoClaw Wake Word Listener
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jake/nanoclaw
+EnvironmentFile=/home/jake/nanoclaw/.env
+Environment=PULSE_SERVER=unix:/mnt/wslg/runtime-dir/pulse/native
+Environment=PATH=/home/jake/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /home/jake/nanoclaw/scripts/wake-word-listener.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

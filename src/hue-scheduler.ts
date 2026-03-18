@@ -9,13 +9,16 @@
 import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 
 const PROJECT_ROOT = process.cwd();
 const STATE_FILE = path.join(PROJECT_ROOT, 'data', 'hue-fade.json');
+const SCHEDULES_FILE = path.join(PROJECT_ROOT, 'data', 'hue-schedules.json');
 const STEP_INTERVAL_MS = 3000; // brightness step every 3 seconds
+const MAX_SCHEDULES = 5;
 
 // TLS agent for self-signed Hue Bridge cert (local network only)
 const tlsAgent = new https.Agent({ rejectUnauthorized: false });
@@ -33,6 +36,18 @@ interface HueRoom {
   id: string;
   metadata?: { name?: string };
   services?: Array<{ rid: string; rtype: string }>;
+}
+
+// ── Schedule types ─────────────────────────────────────────────────────────────
+
+type ScheduleAction = 'dim' | 'on' | 'off';
+
+interface HueSchedule {
+  id: string;
+  time: string; // HH:MM
+  action: ScheduleAction;
+  brightness?: number; // 1–100, only for 'dim'
+  active: boolean;
 }
 
 // ── In-memory handle ──────────────────────────────────────────────────────────
@@ -415,4 +430,153 @@ export function getFadeStatus(): string {
     return `Fade scheduled at ${timeStr}: "${state.roomName}", ${Math.round(state.durationMs / 60000)} min.`;
   }
   return 'No active fade.';
+}
+
+// ── Hue Scene Scheduler ────────────────────────────────────────────────────────
+
+let scheduleTickInterval: ReturnType<typeof setInterval> | null = null;
+
+function loadSchedules(): HueSchedule[] {
+  try {
+    const raw = fs.readFileSync(SCHEDULES_FILE, 'utf-8');
+    return JSON.parse(raw) as HueSchedule[];
+  } catch {
+    return [];
+  }
+}
+
+function saveSchedules(schedules: HueSchedule[]): void {
+  try {
+    fs.mkdirSync(path.dirname(SCHEDULES_FILE), { recursive: true });
+    fs.writeFileSync(SCHEDULES_FILE, JSON.stringify(schedules, null, 2));
+  } catch (err) {
+    logger.warn({ err }, '[hue-schedule] Failed to persist schedules');
+  }
+}
+
+/** Apply a schedule action to the default room (Olohuone) or all lights. */
+async function applyScheduleAction(schedule: HueSchedule): Promise<void> {
+  const { bridgeIp, apiKey } = getConfig();
+  if (!bridgeIp || !apiKey) {
+    logger.error('[hue-schedule] HUE_BRIDGE_IP or HUE_API_KEY not set');
+    return;
+  }
+
+  const roomName = 'Olohuone';
+  let groupedLightId: string | null;
+  try {
+    groupedLightId = await findRoomGroupedLightId(bridgeIp, apiKey, roomName);
+  } catch (err) {
+    logger.error({ err }, '[hue-schedule] Failed to reach Hue Bridge');
+    return;
+  }
+  if (!groupedLightId) {
+    logger.error({ roomName }, '[hue-schedule] Room not found');
+    return;
+  }
+
+  const body: Record<string, unknown> = {};
+  if (schedule.action === 'dim' && schedule.brightness !== undefined) {
+    body.on = { on: true };
+    body.dimming = { brightness: schedule.brightness };
+  } else if (schedule.action === 'on') {
+    body.on = { on: true };
+  } else if (schedule.action === 'off') {
+    body.on = { on: false };
+  }
+
+  try {
+    await hueRequest(bridgeIp, apiKey, 'PUT', `/resource/grouped_light/${groupedLightId}`, body);
+    logger.info({ schedule }, '[hue-schedule] Action applied');
+  } catch (err) {
+    logger.error({ err, schedule }, '[hue-schedule] Failed to apply action');
+  }
+}
+
+function startScheduleTick(): void {
+  if (scheduleTickInterval) return;
+  scheduleTickInterval = setInterval(() => {
+    const schedules = loadSchedules();
+    const active = schedules.filter((s) => s.active);
+    if (active.length === 0) return;
+
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, '0');
+    const mm = String(now.getMinutes()).padStart(2, '0');
+    const currentTime = `${hh}:${mm}`;
+
+    for (const schedule of active) {
+      if (schedule.time === currentTime) {
+        logger.info({ schedule }, '[hue-schedule] Firing scheduled action');
+        void applyScheduleAction(schedule);
+      }
+    }
+  }, 60_000); // check every minute
+}
+
+/** Call once at startup to restore schedules and start the tick loop. */
+export function initHueScheduleRunner(): void {
+  const schedules = loadSchedules();
+  const active = schedules.filter((s) => s.active);
+  if (active.length > 0) {
+    logger.info({ count: active.length }, '[hue-schedule] Restored schedules');
+  }
+  startScheduleTick();
+}
+
+/** Add a new recurring schedule. Returns a status message. */
+export function addHueSchedule(
+  time: string,
+  action: ScheduleAction,
+  brightness?: number,
+): string {
+  const [hh, mm] = time.split(':').map(Number);
+  if (isNaN(hh) || isNaN(mm) || hh < 0 || hh > 23 || mm < 0 || mm > 59) {
+    return `Invalid time "${time}". Use HH:MM format (e.g. 22:00).`;
+  }
+  if (action === 'dim' && (brightness === undefined || brightness < 1 || brightness > 100)) {
+    return 'Brightness must be 1–100 for dim action.';
+  }
+
+  const schedules = loadSchedules();
+  const active = schedules.filter((s) => s.active);
+  if (active.length >= MAX_SCHEDULES) {
+    return `Max ${MAX_SCHEDULES} active schedules reached. Cancel one first (/schedule hue cancel <id>).`;
+  }
+
+  const id = crypto.randomBytes(3).toString('hex');
+  const schedule: HueSchedule = {
+    id,
+    time: `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`,
+    action,
+    ...(action === 'dim' ? { brightness } : {}),
+    active: true,
+  };
+  schedules.push(schedule);
+  saveSchedules(schedules);
+  startScheduleTick();
+
+  const desc = action === 'dim' ? `dim to ${brightness}%` : action;
+  return `Schedule added [${id}]: ${desc} at ${schedule.time} daily.`;
+}
+
+/** List active schedules. */
+export function listHueSchedules(): string {
+  const schedules = loadSchedules().filter((s) => s.active);
+  if (schedules.length === 0) return 'No active Hue schedules.';
+  const lines = schedules.map((s) => {
+    const desc = s.action === 'dim' ? `dim ${s.brightness}%` : s.action;
+    return `• [${s.id}] ${s.time} — ${desc}`;
+  });
+  return `Active schedules:\n${lines.join('\n')}`;
+}
+
+/** Cancel a schedule by ID. */
+export function cancelHueSchedule(id: string): string {
+  const schedules = loadSchedules();
+  const idx = schedules.findIndex((s) => s.id === id && s.active);
+  if (idx === -1) return `No active schedule with id "${id}".`;
+  schedules[idx].active = false;
+  saveSchedules(schedules);
+  return `Schedule [${id}] cancelled.`;
 }

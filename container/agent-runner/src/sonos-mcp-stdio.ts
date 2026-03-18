@@ -220,6 +220,241 @@ server.tool(
   },
 );
 
+// ── Tool: sonos_state ─────────────────────────────────────────────────────────
+
+server.tool(
+  'sonos_state',
+  'Return full state of a Sonos room: track title, artist, album, playbackState, volume, source type (music/line_in).',
+  { room: z.string().describe('Room name exactly as shown in sonos_list_rooms') },
+  async (args) => {
+    if (!SONOS_API_URL) return notConfigured();
+    const room = encodeURIComponent(args.room);
+    try {
+      const result = await sonosGet(`/${room}/state`);
+      if (!result.ok) {
+        return { content: [{ type: 'text' as const, text: `Sonos API error ${result.status}` }], isError: true };
+      }
+      const state = result.data as {
+        currentTrack?: { title?: string; artist?: string; album?: string; type?: string };
+        playbackState?: string;
+        volume?: number;
+        mute?: boolean;
+        shuffle?: boolean;
+        repeat?: string;
+      };
+      const track = state.currentTrack;
+      const sourceType = track?.type === 'line_in' ? 'TV/line-in' : 'music queue';
+      const lines = [
+        `Room: ${args.room}`,
+        `State: ${state.playbackState || 'STOPPED'}`,
+        `Source: ${sourceType}`,
+        `Volume: ${state.volume ?? '?'}%${state.mute ? ' (muted)' : ''}`,
+        `Shuffle: ${state.shuffle ? 'on' : 'off'}`,
+        `Repeat: ${state.repeat || 'off'}`,
+      ];
+      if (track?.title) lines.push(`Track: ${track.title}${track.artist ? ` — ${track.artist}` : ''}${track.album ? ` (${track.album})` : ''}`);
+      return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  },
+);
+
+// ── Tool: sonos_favorites ──────────────────────────────────────────────────────
+
+server.tool(
+  'sonos_favorites',
+  'List all saved Sonos favorites.',
+  {},
+  async () => {
+    if (!SONOS_API_URL) return notConfigured();
+    try {
+      // node-sonos-http-api: GET /Olohuone/favorites (any room works for listing)
+      // Try /favorites first, fall back to first zone
+      const zonesResult = await sonosGet('/zones');
+      let room = 'Olohuone';
+      if (zonesResult.ok) {
+        const zones = zonesResult.data as SonosZone[];
+        const firstRoom = zones?.[0]?.coordinator?.roomName;
+        if (firstRoom) room = firstRoom;
+      }
+      const result = await sonosGet(`/${encodeURIComponent(room)}/favorites`);
+      if (!result.ok) {
+        return { content: [{ type: 'text' as const, text: `Sonos API error ${result.status}` }], isError: true };
+      }
+      const favs = result.data as Array<{ title?: string; uri?: string }>;
+      if (!Array.isArray(favs) || favs.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No favorites found.' }] };
+      }
+      const lines = favs.map((f, i) => `${i + 1}. ${f.title || f.uri || 'Unknown'}`);
+      return { content: [{ type: 'text' as const, text: `Sonos favorites:\n${lines.join('\n')}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  },
+);
+
+// ── Tool: sonos_play_favorite ──────────────────────────────────────────────────
+
+server.tool(
+  'sonos_play_favorite',
+  'Play a saved Sonos favorite by name.',
+  {
+    room: z.string().describe('Room name exactly as shown in sonos_list_rooms'),
+    name: z.string().describe('Favorite name exactly as returned by sonos_favorites'),
+  },
+  async (args) => {
+    if (!SONOS_API_URL) return notConfigured();
+    const room = encodeURIComponent(args.room);
+    const favName = encodeURIComponent(args.name);
+    try {
+      const result = await sonosGet(`/${room}/favorite/${favName}`);
+      if (!result.ok) {
+        return { content: [{ type: 'text' as const, text: `Sonos API error ${result.status}` }], isError: true };
+      }
+      return { content: [{ type: 'text' as const, text: `${args.room}: playing favorite "${args.name}"` }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  },
+);
+
+// ── Tool: sonos_source ────────────────────────────────────────────────────────
+
+server.tool(
+  'sonos_source',
+  'Switch audio source: "linein" or "tv" switches to TV/SPDIF line-in; "queue" resumes the Sonos music queue.',
+  {
+    room: z.string().describe('Room name exactly as shown in sonos_list_rooms'),
+    source: z.enum(['linein', 'tv', 'queue']).describe('"linein"/"tv" = TV/SPDIF input, "queue" = resume Sonos queue'),
+  },
+  async (args) => {
+    if (!SONOS_API_URL) return notConfigured();
+    const room = encodeURIComponent(args.room);
+    try {
+      const path = args.source === 'queue' ? `/${room}/play` : `/${room}/linein`;
+      const result = await sonosGet(path);
+      if (!result.ok) {
+        return { content: [{ type: 'text' as const, text: `Sonos API error ${result.status}` }], isError: true };
+      }
+      const label = args.source === 'queue' ? 'music queue' : 'TV/line-in';
+      return { content: [{ type: 'text' as const, text: `${args.room}: switched to ${label}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  },
+);
+
+// ── Tool: sonos_shuffle ───────────────────────────────────────────────────────
+
+server.tool(
+  'sonos_shuffle',
+  'Toggle shuffle on or off for a Sonos room.',
+  {
+    room: z.string().describe('Room name exactly as shown in sonos_list_rooms'),
+    on: z.boolean().describe('true to enable shuffle, false to disable'),
+  },
+  async (args) => {
+    if (!SONOS_API_URL) return notConfigured();
+    const room = encodeURIComponent(args.room);
+    const state = args.on ? 'on' : 'off';
+    try {
+      const result = await sonosGet(`/${room}/shuffle/${state}`);
+      if (!result.ok) {
+        return { content: [{ type: 'text' as const, text: `Sonos API error ${result.status}` }], isError: true };
+      }
+      return { content: [{ type: 'text' as const, text: `${args.room}: shuffle ${state}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  },
+);
+
+// ── Tool: sonos_repeat ────────────────────────────────────────────────────────
+
+server.tool(
+  'sonos_repeat',
+  'Toggle repeat on or off for a Sonos room.',
+  {
+    room: z.string().describe('Room name exactly as shown in sonos_list_rooms'),
+    on: z.boolean().describe('true to enable repeat, false to disable'),
+  },
+  async (args) => {
+    if (!SONOS_API_URL) return notConfigured();
+    const room = encodeURIComponent(args.room);
+    const state = args.on ? 'on' : 'off';
+    try {
+      const result = await sonosGet(`/${room}/repeat/${state}`);
+      if (!result.ok) {
+        return { content: [{ type: 'text' as const, text: `Sonos API error ${result.status}` }], isError: true };
+      }
+      return { content: [{ type: 'text' as const, text: `${args.room}: repeat ${state}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  },
+);
+
+// ── Tool: sonos_sleep ─────────────────────────────────────────────────────────
+
+server.tool(
+  'sonos_sleep',
+  'Set a sleep timer for a Sonos room. Use 0 to cancel.',
+  {
+    room: z.string().describe('Room name exactly as shown in sonos_list_rooms'),
+    seconds: z.number().min(0).describe('Sleep timer in seconds (0 to cancel)'),
+  },
+  async (args) => {
+    if (!SONOS_API_URL) return notConfigured();
+    const room = encodeURIComponent(args.room);
+    try {
+      const result = await sonosGet(`/${room}/sleep/${args.seconds}`);
+      if (!result.ok) {
+        return { content: [{ type: 'text' as const, text: `Sonos API error ${result.status}` }], isError: true };
+      }
+      const label = args.seconds === 0 ? 'cancelled' : `set to ${args.seconds}s`;
+      return { content: [{ type: 'text' as const, text: `${args.room}: sleep timer ${label}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  },
+);
+
+// ── Tool: sonos_group ─────────────────────────────────────────────────────────
+
+server.tool(
+  'sonos_group',
+  'Group or ungroup Sonos rooms. action="leave" makes the room standalone; action="join" joins it to another room.',
+  {
+    room: z.string().describe('Room name exactly as shown in sonos_list_rooms'),
+    action: z.enum(['leave', 'join']).describe('"leave" = make standalone, "join" = join another room'),
+    target: z.string().optional().describe('Room to join (required for action="join")'),
+  },
+  async (args) => {
+    if (!SONOS_API_URL) return notConfigured();
+    const room = encodeURIComponent(args.room);
+    try {
+      let path: string;
+      if (args.action === 'leave') {
+        path = `/${room}/leave`;
+      } else {
+        if (!args.target) {
+          return { content: [{ type: 'text' as const, text: 'target room is required for action="join"' }], isError: true };
+        }
+        path = `/${encodeURIComponent(args.target)}/add/${room}`;
+      }
+      const result = await sonosGet(path);
+      if (!result.ok) {
+        return { content: [{ type: 'text' as const, text: `Sonos API error ${result.status}` }], isError: true };
+      }
+      const label = args.action === 'leave' ? 'left group (standalone)' : `joined ${args.target}`;
+      return { content: [{ type: 'text' as const, text: `${args.room}: ${label}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  },
+);
+
 // ── Start ──────────────────────────────────────────────────────────────────────
 
 if (!SONOS_API_URL) {

@@ -261,6 +261,47 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
   return lines.join('\n');
 }
 
+const TOKEN_USAGE_LOG = '/workspace/group/token-usage.jsonl';
+
+// Pricing in USD per million tokens (input/output)
+const MODEL_PRICING: Record<string, { input: number; output: number }> = {
+  'claude-sonnet-4-6': { input: 3.00, output: 15.00 },
+  'claude-opus-4-6':   { input: 5.00, output: 25.00 },
+  'claude-haiku-4-5':  { input: 1.00, output: 5.00 },
+};
+
+interface ModelUsageEntry {
+  inputTokens: number;
+  outputTokens: number;
+}
+
+function logTokenUsage(
+  modelUsage: Record<string, ModelUsageEntry>,
+  taskContext?: string,
+): void {
+  const timestamp = new Date().toISOString();
+  for (const [model, usage] of Object.entries(modelUsage)) {
+    const inputTokens = usage.inputTokens || 0;
+    const outputTokens = usage.outputTokens || 0;
+    const entry: Record<string, unknown> = {
+      timestamp,
+      model,
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+    };
+    const pricing = MODEL_PRICING[model];
+    if (pricing) {
+      entry.cost_usd = Math.round(
+        ((inputTokens * pricing.input + outputTokens * pricing.output) / 1_000_000) * 1_000_000
+      ) / 1_000_000;
+    }
+    if (taskContext) entry.task = taskContext.slice(0, 80);
+    try {
+      fs.appendFileSync(TOKEN_USAGE_LOG, JSON.stringify(entry) + '\n');
+    } catch { /* ignore write failures */ }
+  }
+}
+
 /**
  * PreToolUse hook: classifies risk and gates dangerous operations.
  * - Green: allow silently
@@ -337,14 +378,19 @@ function createPreToolUseHook(mcpServerPath: string, chatJid: string): HookCallb
       `Tool: \`${tool_name}\`\n` +
       `Risk: ${risk.reason}\n\n` +
       `\`\`\`\n${commandSummary.slice(0, 600)}\n\`\`\`\n\n` +
-      `Reply *YES* to allow or *NO* to cancel _(5 min timeout)_`;
+      `_(5 min timeout — no reply = blocked)_`;
+
+    const confirmButtons = [
+      { text: '✅ YES — allow', callbackData: `confirm_yes_${confirmId}` },
+      { text: '❌ NO — cancel', callbackData: `confirm_no_${confirmId}` },
+    ];
 
     // Send confirmation request to user via IPC messages directory
     const ipcMsgDir = '/workspace/ipc/messages';
     fs.mkdirSync(ipcMsgDir, { recursive: true });
     fs.writeFileSync(
       path.join(ipcMsgDir, `${confirmId}.json`),
-      JSON.stringify({ type: 'message', chatJid, text: confirmMsg }),
+      JSON.stringify({ type: 'message', chatJid, text: confirmMsg, buttons: confirmButtons }),
     );
 
     // Write confirm request metadata so the host routes the reply back
@@ -572,6 +618,7 @@ async function runQuery(
         'mcp__hue__*',
         'mcp__sonos__*',
         'mcp__samsung_tv__*',
+        'mcp__piper_tts__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -614,8 +661,23 @@ async function runQuery(
           args: [path.join(path.dirname(mcpServerPath), 'samsung-tv-mcp-stdio.js')],
           env: {
             ...(process.env.SAMSUNG_TV_IP ? { SAMSUNG_TV_IP: process.env.SAMSUNG_TV_IP } : {}),
+            ...(process.env.SAMSUNG_TV_MAC ? { SAMSUNG_TV_MAC: process.env.SAMSUNG_TV_MAC } : {}),
             // Store token in mounted group dir so it persists across container restarts
             SAMSUNG_TV_TOKEN_FILE: '/workspace/group/samsung-tv-token.json',
+            // Pass chat context so the MCP can send Telegram notifications (e.g. re-pair prompt)
+            NANOCLAW_CHAT_JID: containerInput.chatJid,
+            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
+          },
+        },
+        piper_tts: {
+          command: 'node',
+          args: [path.join(path.dirname(mcpServerPath), 'piper-tts-mcp-stdio.js')],
+          env: {
+            ...(process.env.SONOS_API_URL ? { SONOS_API_URL: process.env.SONOS_API_URL } : {}),
+            // Sonos clips dir is mounted at /workspace/sonos-clips by container-runner.ts
+            SONOS_CLIPS_PATH: '/workspace/sonos-clips',
+            ...(process.env.ELEVENLABS_API_KEY ? { ELEVENLABS_API_KEY: process.env.ELEVENLABS_API_KEY } : {}),
+            ...(process.env.ELEVENLABS_VOICE_ID ? { ELEVENLABS_VOICE_ID: process.env.ELEVENLABS_VOICE_ID } : {}),
           },
         },
       },
@@ -648,10 +710,13 @@ async function runQuery(
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
 
       // Extract actual model(s) used from modelUsage
-      const modelUsage = (message as { modelUsage?: Record<string, unknown> }).modelUsage;
+      const modelUsage = (message as { modelUsage?: Record<string, ModelUsageEntry> }).modelUsage;
       const modelsUsed = modelUsage ? Object.keys(modelUsage) : [];
       const modelTag = modelsUsed.length > 0 ? `\n\n🤖 ${modelsUsed.join(', ')}` : '';
       log(`Result #${resultCount}: subtype=${message.subtype} models=${modelsUsed.join(',') || 'unknown'}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      if (modelUsage && modelsUsed.length > 0) {
+        logTokenUsage(modelUsage, containerInput.prompt);
+      }
 
       writeOutput({
         status: 'success',

@@ -2,7 +2,7 @@ import fs from 'fs';
 import https from 'https';
 import path from 'path';
 
-import { Api, Bot } from 'grammy';
+import { Api, Bot, InlineKeyboard } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
@@ -12,6 +12,7 @@ import { transcribeAudio } from '../transcription.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
+  InlineButton,
   OnChatMetadata,
   OnInboundMessage,
   RegisteredGroup,
@@ -21,6 +22,7 @@ export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  onCallbackQuery?: (chatJid: string, data: string, answer: (text?: string) => Promise<void>) => void;
 }
 
 /**
@@ -323,6 +325,27 @@ export class TelegramChannel implements Channel {
     this.bot.on('message:location', (ctx) => storeNonText(ctx, '[Location]'));
     this.bot.on('message:contact', (ctx) => storeNonText(ctx, '[Contact]'));
 
+    // Handle inline keyboard button taps
+    this.bot.on('callback_query:data', async (ctx) => {
+      const data = ctx.callbackQuery.data;
+      const chatId = ctx.chat?.id ?? ctx.callbackQuery.message?.chat.id;
+      const chatJid = chatId ? `tg:${chatId}` : '';
+
+      const answer = async (text?: string) => {
+        try {
+          await ctx.answerCallbackQuery({ text });
+        } catch (err) {
+          logger.debug({ err }, 'Failed to answer callback query');
+        }
+      };
+
+      if (this.opts.onCallbackQuery && chatJid) {
+        this.opts.onCallbackQuery(chatJid, data, answer);
+      } else {
+        await answer();
+      }
+    });
+
     // Handle errors gracefully
     this.bot.catch((err) => {
       logger.error({ err: err.message }, 'Telegram bot error');
@@ -374,6 +397,34 @@ export class TelegramChannel implements Channel {
     }
   }
 
+  async sendMessageWithButtons(
+    jid: string,
+    text: string,
+    buttons: InlineButton[],
+  ): Promise<void> {
+    if (!this.bot) {
+      logger.warn('Telegram bot not initialized');
+      return;
+    }
+    try {
+      const numericId = jid.replace(/^tg:/, '');
+      const keyboard = new InlineKeyboard();
+      for (const btn of buttons) {
+        keyboard.text(btn.text, btn.callbackData);
+      }
+      try {
+        await this.bot.api.sendMessage(numericId, text, {
+          parse_mode: 'Markdown',
+          reply_markup: keyboard,
+        });
+      } catch {
+        await this.bot.api.sendMessage(numericId, text, { reply_markup: keyboard });
+      }
+    } catch (err) {
+      logger.error({ jid, err }, 'Failed to send Telegram message with buttons');
+    }
+  }
+
   isConnected(): boolean {
     return this.bot !== null;
   }
@@ -412,8 +463,9 @@ export class TelegramChannel implements Channel {
     try {
       const numericId = jid.replace(/^tg:/, '');
       await this.bot.api.sendChatAction(numericId, 'typing');
+      logger.debug({ jid }, 'Telegram typing action sent');
     } catch (err) {
-      logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
+      logger.warn({ jid, err }, 'Failed to send Telegram typing indicator');
     }
   }
 }

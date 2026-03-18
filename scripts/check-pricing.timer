@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly Anthropic pricing check (Monday 09:00 Helsinki / 07:00 UTC)
+
+[Timer]
+# Every Monday at 07:00 UTC (09:00 Helsinki / EET, 10:00 EEST summer)
+OnCalendar=Mon *-*-* 07:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

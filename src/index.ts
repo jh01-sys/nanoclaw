@@ -4,6 +4,7 @@ import path from 'path';
 import {
   ASSISTANT_NAME,
   CREDENTIAL_PROXY_PORT,
+  DATA_DIR,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
   TIMEZONE,
@@ -61,12 +62,13 @@ import {
 import {
   startCcBridge,
   handleCcConfirmationReply,
+  handleCcConfirmationCallback,
   createCcTaskFromMessage,
 } from './cc-bridge.js';
 import { startCcWorker } from './cc-worker.js';
 import { readEnvFile } from './env.js';
 import { isDevCommand, handleDevCommand } from './dev-commands.js';
-import { initHueScheduler } from './hue-scheduler.js';
+import { initHueScheduler, initHueScheduleRunner } from './hue-scheduler.js';
 import { resolveModel } from './model-router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
@@ -117,6 +119,17 @@ function handleConfirmationReply(chatJid: string, content: string): boolean {
     `Risk confirmation ${confirmed ? 'approved' : 'denied'}`,
   );
   return true;
+}
+
+const ANNIE_ACTIVITY_FILE = path.join(DATA_DIR, 'ipc', 'cc-inbox', 'annie-activity.json');
+
+function writeAnnieActivity(active: boolean, task?: string): void {
+  try {
+    fs.writeFileSync(
+      ANNIE_ACTIVITY_FILE,
+      JSON.stringify({ active, task: task ?? '', startedAt: active ? new Date().toISOString() : null }),
+    );
+  } catch {}
 }
 
 let lastTimestamp = '';
@@ -302,52 +315,84 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  await channel.setTyping?.(chatJid, true);
+  // Start typing indicator and keep it alive every 4s (Telegram expires after ~5s)
+  let typingInterval: ReturnType<typeof setInterval> | undefined;
+  if (channel.setTyping) {
+    logger.info({ chatJid }, '[typing] sending typing indicator to');
+    channel.setTyping(chatJid, true).catch((err) => logger.warn({ chatJid, err }, '[typing] setTyping initial call failed'));
+    typingInterval = setInterval(() => {
+      logger.debug({ chatJid }, '[typing] refreshing typing indicator');
+      channel.setTyping!(chatJid, true).catch((err) => logger.warn({ chatJid, err }, '[typing] setTyping interval call failed'));
+    }, 4000);
+  } else {
+    logger.warn({ chatJid }, '[typing] channel has no setTyping method');
+  }
+
+  // Write Annie activity for dashboard visibility
+  const truncate = (text: string, max: number) => {
+    const t = text.trim().replace(/\n+/g, ' ');
+    return t.length > max ? t.slice(0, max) + '…' : t;
+  };
+  let taskDesc: string;
+  if (hasCcMessage) {
+    const ccMsg = missedMessages.find((m) => m.sender === 'CC');
+    taskDesc = 'Reviewing CC: ' + truncate(ccMsg?.content ?? '', 60);
+  } else {
+    const lastUserMsg = messagesToProcess[messagesToProcess.length - 1];
+    taskDesc = 'Replying to: ' + truncate(lastUserMsg?.content ?? '', 80);
+  }
+  writeAnnieActivity(true, taskDesc);
+
   let hadError = false;
   let outputSentToUser = false;
   let hadSuccess = false; // true if any result with status=success was received
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      const text = formatOutbound(raw);
-      logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
+  let output = '';
+  try {
+    output = await runAgent(group, prompt, chatJid, async (result) => {
+      // Streaming output callback — called for each agent result
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        const text = formatOutbound(raw);
+        logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
 
-      if (text) {
-        const outbound = `🤖 *${ASSISTANT_NAME}:* ${text}`;
-        await channel.sendMessage(chatJid, outbound);
-        storeMessageDirect({
-          id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          chat_jid: chatJid,
-          sender: ASSISTANT_NAME,
-          sender_name: ASSISTANT_NAME,
-          content: outbound,
-          timestamp: new Date().toISOString(),
-          is_from_me: true,
-          is_bot_message: true,
-        });
-        outputSentToUser = true;
+        if (text) {
+          const outbound = `🤖 *${ASSISTANT_NAME}:* ${text}`;
+          await channel.sendMessage(chatJid, outbound);
+          storeMessageDirect({
+            id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            chat_jid: chatJid,
+            sender: ASSISTANT_NAME,
+            sender_name: ASSISTANT_NAME,
+            content: outbound,
+            timestamp: new Date().toISOString(),
+            is_from_me: true,
+            is_bot_message: true,
+          });
+          outputSentToUser = true;
+        }
+        // Only reset idle timer on actual results, not session-update markers (result: null)
+        resetIdleTimer();
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-      hadSuccess = true;
-    }
+      if (result.status === 'success') {
+        queue.notifyIdle(chatJid);
+        hadSuccess = true;
+      }
 
-    if (result.status === 'error') {
-      hadError = true;
-    }
-  });
-
-  await channel.setTyping?.(chatJid, false);
-  if (idleTimer) clearTimeout(idleTimer);
+      if (result.status === 'error') {
+        hadError = true;
+      }
+    });
+  } finally {
+    if (typingInterval) clearInterval(typingInterval);
+    channel.setTyping?.(chatJid, false).catch(() => {});
+    writeAnnieActivity(false);
+    if (idleTimer) clearTimeout(idleTimer);
+  }
 
   if (output === 'error' || hadError) {
     // If we already sent output to the user, or the agent completed successfully
@@ -618,9 +663,28 @@ async function main(): Promise<void> {
     PROXY_BIND_HOST,
   );
 
+  // Reset Annie activity on startup (clears any stale active=true from previous run)
+  writeAnnieActivity(false);
+
+  // Safety watchdog: if annie-activity.json stays active for >3 min, auto-reset
+  setInterval(() => {
+    try {
+      const raw = fs.readFileSync(ANNIE_ACTIVITY_FILE, 'utf8');
+      const data = JSON.parse(raw) as { active: boolean; startedAt: string | null };
+      if (data.active && data.startedAt) {
+        const age = Date.now() - new Date(data.startedAt).getTime();
+        if (age > 3 * 60 * 1000) {
+          logger.warn({ ageMs: age }, 'Annie activity watchdog: resetting stale active=true');
+          writeAnnieActivity(false);
+        }
+      }
+    } catch {}
+  }, 30_000);
+
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    writeAnnieActivity(false);
     proxyServer.close();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
@@ -743,6 +807,38 @@ async function main(): Promise<void> {
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
+    onCallbackQuery: (chatJid: string, data: string, answer: (text?: string) => Promise<void>) => {
+      // Parse confirm_yes_<id> / confirm_no_<id> button payloads
+      const match = data.match(/^confirm_(yes|no)_(.+)$/);
+      if (!match) {
+        answer().catch(() => {});
+        return;
+      }
+      const approved = match[1] === 'yes';
+      const confirmId = match[2];
+
+      // Try CC confirmation first (data/ipc/cc-confirm/)
+      if (handleCcConfirmationCallback(confirmId, approved)) {
+        answer(approved ? '✅ Approved' : '🚫 Blocked').catch(() => {});
+        return;
+      }
+
+      // Try Annie confirmation (group ipc/confirm/ dir)
+      const group = registeredGroups[chatJid];
+      if (group) {
+        const confirmDir = path.join(resolveGroupIpcPath(group.folder), 'confirm');
+        const requestPath = path.join(confirmDir, `${confirmId}.request`);
+        if (fs.existsSync(requestPath)) {
+          const responsePath = path.join(confirmDir, `${confirmId}.response`);
+          fs.writeFileSync(responsePath, JSON.stringify({ confirmed: approved }));
+          logger.info({ confirmId, approved, chatJid }, `Annie confirmation ${approved ? 'approved' : 'denied'} via button`);
+          answer(approved ? '✅ Approved' : '🚫 Blocked').catch(() => {});
+          return;
+        }
+      }
+
+      answer('No pending confirmation found').catch(() => {});
+    },
   };
 
   // Create and connect all registered channels.
@@ -775,6 +871,18 @@ async function main(): Promise<void> {
         return;
       }
       await channel.sendMessage(jid, text);
+    },
+    sendMessageWithButtons: async (jid, text, buttons) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) {
+        logger.warn({ jid }, 'CC bridge: no channel for Dev group JID');
+        return;
+      }
+      if (channel.sendMessageWithButtons) {
+        await channel.sendMessageWithButtons(jid, text, buttons);
+      } else {
+        await channel.sendMessage(jid, text);
+      }
     },
     devGroupJid: () => readEnvFile(['CC_BRIDGE_JID']).CC_BRIDGE_JID || null,
     storeCcMessage: (chatJid, text) => {
@@ -817,10 +925,15 @@ async function main(): Promise<void> {
         await (channel as any).sendReaction(jid, messageId, emoji);
       }
     },
+    setTyping: async (jid, isTyping) => {
+      const channel = findChannel(channels, jid);
+      await channel?.setTyping?.(jid, isTyping);
+    },
   });
 
   // Start subsystems (independently of connection handler)
   initHueScheduler();
+  initHueScheduleRunner();
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,
@@ -842,6 +955,14 @@ async function main(): Promise<void> {
     sendMessage: (jid, text) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      return channel.sendMessage(jid, text);
+    },
+    sendMessageWithButtons: (jid, text, buttons) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (channel.sendMessageWithButtons) {
+        return channel.sendMessageWithButtons(jid, text, buttons);
+      }
       return channel.sendMessage(jid, text);
     },
     sendReaction: async (jid, messageId, emoji) => {

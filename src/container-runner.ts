@@ -262,6 +262,17 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Mount node-sonos-http-api clips directory so the Piper TTS MCP can copy
+  // generated MP3s there for /clip/{filename} playback (no URL required).
+  const sonosClipsDir = '/home/jake/node-sonos-http-api/static/clips';
+  if (fs.existsSync(sonosClipsDir)) {
+    mounts.push({
+      hostPath: sonosClipsDir,
+      containerPath: '/workspace/sonos-clips',
+      readonly: false,
+    });
+  }
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
@@ -323,6 +334,8 @@ function buildContainerArgs(
     'SAMSUNG_TV_IP',
     'SAMSUNG_TV_MAC',
     'CC_BRIDGE_JID',
+    'ELEVENLABS_API_KEY',
+    'ELEVENLABS_VOICE_ID',
   ]);
   if (hueEnv.HUE_BRIDGE_IP)
     args.push('-e', `HUE_BRIDGE_IP=${hueEnv.HUE_BRIDGE_IP}`);
@@ -342,6 +355,11 @@ function buildContainerArgs(
   // Pass dev group JID so the agent can forward 🟡 risk events there
   if (hueEnv.CC_BRIDGE_JID)
     args.push('-e', `NANOCLAW_CC_BRIDGE_JID=${hueEnv.CC_BRIDGE_JID}`);
+  // Pass ElevenLabs credentials for Neural TTS
+  if (hueEnv.ELEVENLABS_API_KEY)
+    args.push('-e', `ELEVENLABS_API_KEY=${hueEnv.ELEVENLABS_API_KEY}`);
+  if (hueEnv.ELEVENLABS_VOICE_ID)
+    args.push('-e', `ELEVENLABS_VOICE_ID=${hueEnv.ELEVENLABS_VOICE_ID}`);
 
   // Pass OLLAMA_HOST so the MCP server can reach the host's Ollama instance.
   // On WSL2, host.docker.internal resolves to the Windows host, not WSL2,
@@ -349,6 +367,13 @@ function buildContainerArgs(
   const ollamaHost = resolveOllamaHost();
   if (ollamaHost) {
     args.push('-e', `OLLAMA_HOST=${ollamaHost}`);
+  }
+
+  // Pass SONOS_CLIPS_PATH so the Piper TTS MCP can copy generated MP3s into
+  // node-sonos-http-api's static/clips directory, enabling /clip/{filename} playback.
+  const sonosClipsDir = '/home/jake/node-sonos-http-api/static/clips';
+  if (fs.existsSync(sonosClipsDir)) {
+    args.push('-e', 'SONOS_CLIPS_PATH=/workspace/sonos-clips');
   }
 
   // Pass the classified model to the container agent

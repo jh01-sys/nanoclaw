@@ -1,0 +1,15 @@
+[Unit]
+Description=NanoClaw CC Task Tracker
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/nanoclaw
+ExecStart=/usr/bin/node scripts/cc-task-tracker.mjs
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

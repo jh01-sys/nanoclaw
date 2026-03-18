@@ -346,9 +346,14 @@ server.tool(
     try {
       fs.mkdirSync(CC_INBOX_DIR, { recursive: true });
 
-      // Dedup: reject if a pending task with the same title already exists
-      const existing = fs.readdirSync(CC_INBOX_DIR).filter((f) => f.endsWith('.task'));
-      for (const f of existing) {
+      // Dedup: reject if a pending task with the same title already exists,
+      // OR if a recently completed task (.done file) has the same title (prevents
+      // re-sending a task that CC already finished in the same session).
+      const allFiles = fs.readdirSync(CC_INBOX_DIR);
+      const taskFiles = allFiles.filter((f) => f.endsWith('.task'));
+      const doneFiles = allFiles.filter((f) => f.endsWith('.done'));
+
+      for (const f of taskFiles) {
         try {
           const t = JSON.parse(fs.readFileSync(path.join(CC_INBOX_DIR, f), 'utf-8'));
           if (t.title === args.title) {
@@ -356,6 +361,70 @@ server.tool(
               content: [{ type: 'text' as const, text: `Task "${args.title}" is already pending (id: ${t.id}). CC will handle it shortly.` }],
             };
           }
+        } catch {}
+      }
+
+      // Check tasks.json for active CC tasks with similar title/description (>60% keyword overlap)
+      const TASKS_FILE = '/workspace/group/tasks.json';
+      try {
+        const tasksData = JSON.parse(fs.readFileSync(TASKS_FILE, 'utf-8'));
+        const allTasks = Array.isArray(tasksData) ? tasksData : (tasksData.tasks || []);
+        const activeCcTasks = allTasks.filter(
+          (t: { owner?: string; status?: string }) =>
+            t.owner === 'CC' &&
+            (t.status === 'inProgress' || t.status === 'pendingTesting'),
+        );
+
+        const keywords = (s: string): Set<string> =>
+          new Set(s.toLowerCase().split(/\W+/).filter((w) => w.length >= 4));
+        const similarity = (a: string, b: string): number => {
+          const wa = keywords(a);
+          const wb = keywords(b);
+          const intersection = [...wa].filter((w) => wb.has(w)).length;
+          const maxSize = Math.max(wa.size, wb.size);
+          return maxSize === 0 ? 0 : intersection / maxSize;
+        };
+
+        const newText = `${args.title} ${args.body}`;
+        for (const t of activeCcTasks) {
+          const existingText = `${t.title || ''} ${t.description || ''} ${t.notes || ''}`;
+          if (similarity(newText, existingText) > 0.6) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Similar task already active: #${t.id} "${t.title}" — wait for it to complete or cancel it first.`,
+                },
+              ],
+            };
+          }
+        }
+      } catch {}
+
+      // Check recently completed tasks — .done files from the last 2 hours
+      const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+      for (const f of doneFiles) {
+        const donePath = path.join(CC_INBOX_DIR, f);
+        try {
+          const stat = fs.statSync(donePath);
+          if (Date.now() - stat.mtimeMs > TWO_HOURS_MS) continue; // too old, skip
+          // .done files don't store title — match by checking the corresponding .task id
+          // The id is the filename stem; try to find matching tasks.json entry via cc_task_id
+          const taskId = f.slice(0, -5);
+          // Quick heuristic: read tasks.json and check if this id maps to same title
+          const tasksPath = '/workspace/group/tasks.json';
+          try {
+            const tasksData = JSON.parse(fs.readFileSync(tasksPath, 'utf-8'));
+            const match = tasksData.tasks?.find(
+              (t: { cc_task_id?: string; title?: string }) =>
+                t.cc_task_id === taskId && t.title === args.title,
+            );
+            if (match) {
+              return {
+                content: [{ type: 'text' as const, text: `Task "${args.title}" was already completed by CC recently (id: ${taskId}). No need to resend.` }],
+              };
+            }
+          } catch {}
         } catch {}
       }
 

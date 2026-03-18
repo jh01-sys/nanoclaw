@@ -24,7 +24,18 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
+    lame \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Piper TTS binary and Finnish voice model
+RUN mkdir -p /opt/piper && \
+    curl -fsSL https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz \
+      | tar -xz -C /opt/piper --strip-components=1 && \
+    curl -fsSL "https://huggingface.co/rhasspy/piper-voices/resolve/main/fi/fi_FI/harri/medium/fi_FI-harri-medium.onnx?download=true" \
+      -o /opt/piper/fi_FI-harri-medium.onnx && \
+    curl -fsSL "https://huggingface.co/rhasspy/piper-voices/resolve/main/fi/fi_FI/harri/medium/fi_FI-harri-medium.onnx.json?download=true" \
+      -o /opt/piper/fi_FI-harri-medium.onnx.json && \
+    chmod +x /opt/piper/piper
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
@@ -49,7 +60,7 @@ COPY agent-runner/ ./
 RUN npm run build
 
 # Create workspace directories
-RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
+RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input /workspace/group/tts-cache
 
 # Create entrypoint script
 # Container input (prompt, group info) is passed via stdin JSON.
