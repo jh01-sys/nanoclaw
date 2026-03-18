@@ -28,6 +28,7 @@ import {
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
 import { readEnvFile } from './env.js';
+import { resolveModel } from './model-router.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -89,15 +90,17 @@ function buildVolumeMounts(
   const groupDir = resolveGroupFolderPath(group.folder);
 
   if (isMain) {
-    // Main gets the project root read-only. Writable paths the agent needs
-    // (group folder, IPC, .claude/) are mounted separately below.
-    // Read-only prevents the agent from modifying host application code
-    // (src/, dist/, package.json, etc.) which would bypass the sandbox
-    // entirely on next restart.
+    // Main gets the project root read-write for git branch isolation.
+    // The agent works on a feature branch (never main) and changes only
+    // take effect after explicit /merge approval. Safety layers:
+    // - CLAUDE.md enforces feature branch workflow
+    // - Risk flagging gates git push, rm -rf, credential access
+    // - Sender allowlist restricts who can trigger commands
+    // - .env is still shadowed below (credentials never exposed)
     mounts.push({
       hostPath: projectRoot,
       containerPath: '/workspace/project',
-      readonly: true,
+      readonly: false,
     });
 
     // Shadow .env so the agent cannot read secrets from the mounted project root.
@@ -193,10 +196,37 @@ function buildVolumeMounts(
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+
+  // Mount the live cc_status.json directly — Annie always sees current CC state,
+  // not a stale snapshot from when her container launched.
+  const ccStatusSrc = path.join(DATA_DIR, 'ipc', 'cc-inbox', 'cc_status.json');
+  if (!fs.existsSync(ccStatusSrc)) {
+    fs.writeFileSync(
+      ccStatusSrc,
+      JSON.stringify({
+        updated: new Date().toISOString(),
+        idle: true,
+        running: [],
+        queued: [],
+        recent_completions: [],
+      }),
+    );
+  }
+  // The file is added as a separate read-only bind mount below, overriding the copy in groupIpcDir.
+
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
     readonly: false,
+  });
+
+  // Overlay the live cc_status.json on top of the IPC dir — Annie always sees
+  // current CC state, not a stale snapshot. Mounted after the IPC dir so it
+  // takes precedence for this specific file.
+  mounts.push({
+    hostPath: ccStatusSrc,
+    containerPath: '/workspace/ipc/cc_status.json',
+    readonly: true,
   });
 
   // Copy agent-runner source into a per-group writable location so agents
@@ -214,8 +244,17 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
-    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+  // Sync agent-runner source files into per-group dir on every start.
+  // Files present in source always overwrite the per-group copy (keeps MCP servers up-to-date).
+  // Extra files the agent has added (not in source) are preserved.
+  if (fs.existsSync(agentRunnerSrc)) {
+    fs.mkdirSync(groupAgentRunnerDir, { recursive: true });
+    for (const file of fs.readdirSync(agentRunnerSrc)) {
+      fs.copyFileSync(
+        path.join(agentRunnerSrc, file),
+        path.join(groupAgentRunnerDir, file),
+      );
+    }
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,
@@ -239,8 +278,17 @@ function buildVolumeMounts(
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  prompt?: string,
 ): string[] {
-  const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+  const args: string[] = [
+    'run',
+    '-i',
+    '--rm',
+    '--name',
+    containerName,
+    '--memory=1g',
+    '--memory-swap=1g',
+  ];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
@@ -265,6 +313,36 @@ function buildContainerArgs(
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
 
+  // Pass Hue Bridge credentials so the Hue MCP server can control lights.
+  // Credentials flow: host .env → container env var → MCP server (never in container filesystem).
+  // Use readEnvFile (not process.env) — systemd does not load .env into the process environment.
+  const hueEnv = readEnvFile([
+    'HUE_BRIDGE_IP',
+    'HUE_API_KEY',
+    'SONOS_API_URL',
+    'SAMSUNG_TV_IP',
+    'SAMSUNG_TV_MAC',
+    'CC_BRIDGE_JID',
+  ]);
+  if (hueEnv.HUE_BRIDGE_IP)
+    args.push('-e', `HUE_BRIDGE_IP=${hueEnv.HUE_BRIDGE_IP}`);
+  if (hueEnv.HUE_API_KEY) args.push('-e', `HUE_API_KEY=${hueEnv.HUE_API_KEY}`);
+  if (hueEnv.SONOS_API_URL)
+    args.push('-e', `SONOS_API_URL=${hueEnv.SONOS_API_URL}`);
+  if (hueEnv.SAMSUNG_TV_IP) {
+    args.push('-e', `SAMSUNG_TV_IP=${hueEnv.SAMSUNG_TV_IP}`);
+    // Store pairing token in the group workspace so it persists across container restarts.
+    args.push(
+      '-e',
+      'SAMSUNG_TV_TOKEN_FILE=/workspace/group/samsung-tv-token.json',
+    );
+  }
+  if (hueEnv.SAMSUNG_TV_MAC)
+    args.push('-e', `SAMSUNG_TV_MAC=${hueEnv.SAMSUNG_TV_MAC}`);
+  // Pass dev group JID so the agent can forward 🟡 risk events there
+  if (hueEnv.CC_BRIDGE_JID)
+    args.push('-e', `NANOCLAW_CC_BRIDGE_JID=${hueEnv.CC_BRIDGE_JID}`);
+
   // Pass OLLAMA_HOST so the MCP server can reach the host's Ollama instance.
   // On WSL2, host.docker.internal resolves to the Windows host, not WSL2,
   // so we use the WSL2 network interface IP instead.
@@ -272,6 +350,10 @@ function buildContainerArgs(
   if (ollamaHost) {
     args.push('-e', `OLLAMA_HOST=${ollamaHost}`);
   }
+
+  // Pass the classified model to the container agent
+  const model = resolveModel(prompt || '');
+  args.push('-e', `CLAUDE_MODEL=${model}`);
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
@@ -310,7 +392,10 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+  const containerArgs = buildContainerArgs(mounts, containerName, input.prompt);
+
+  // Determine which model was selected (for logging)
+  const selectedModel = resolveModel(input.prompt);
 
   logger.debug(
     {
@@ -325,11 +410,17 @@ export async function runContainerAgent(
     'Container mount configuration',
   );
 
+  // Write the selected model and chatJid to IPC so the agent-runner can read them per-query
+  const groupIpcDir = resolveGroupIpcPath(group.folder);
+  fs.writeFileSync(path.join(groupIpcDir, 'model'), selectedModel);
+  fs.writeFileSync(path.join(groupIpcDir, 'chat_jid'), input.chatJid);
+
   logger.info(
     {
       group: group.name,
       containerName,
       mountCount: mounts.length,
+      model: selectedModel,
       isMain: input.isMain,
     },
     'Spawning container agent',

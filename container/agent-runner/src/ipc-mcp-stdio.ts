@@ -306,7 +306,7 @@ Use available_groups.json to find the JID for a group. The folder name must be c
     jid: z.string().describe('The chat JID (e.g., "120363336345536173@g.us", "tg:-1001234567890", "dc:1234567890123456")'),
     name: z.string().describe('Display name for the group'),
     folder: z.string().describe('Channel-prefixed folder name (e.g., "whatsapp_family-chat", "telegram_dev-team")'),
-    trigger: z.string().describe('Trigger word (e.g., "@Andy")'),
+    trigger: z.string().describe('Trigger word (e.g., "@Annie")'),
   },
   async (args) => {
     if (!isMain) {
@@ -330,6 +330,81 @@ Use available_groups.json to find the JID for a group. The folder name must be c
     return {
       content: [{ type: 'text' as const, text: `Group "${args.name}" registered. It will start receiving messages immediately.` }],
     };
+  },
+);
+
+server.tool(
+  'cc_send_task',
+  'Delegate an implementation task to CC (Claude Code on the host). CC has full codebase access, build tools, and dev tooling. Use for multi-file changes, debugging, or anything that needs the full project. CC will respond to this chat automatically when done.',
+  {
+    title: z.string().describe('Short task title (one line)'),
+    body: z.string().describe('Full task description — include file paths, error messages, expected behaviour, and relevant context.'),
+    triggerMessageId: z.number().optional().describe('Telegram message_id of the message that triggered this task. CC will react with 👍 instead of sending a separate acknowledgement.'),
+  },
+  async (args) => {
+    const CC_INBOX_DIR = '/workspace/project/data/ipc/cc-inbox';
+    try {
+      fs.mkdirSync(CC_INBOX_DIR, { recursive: true });
+
+      // Dedup: reject if a pending task with the same title already exists
+      const existing = fs.readdirSync(CC_INBOX_DIR).filter((f) => f.endsWith('.task'));
+      for (const f of existing) {
+        try {
+          const t = JSON.parse(fs.readFileSync(path.join(CC_INBOX_DIR, f), 'utf-8'));
+          if (t.title === args.title) {
+            return {
+              content: [{ type: 'text' as const, text: `Task "${args.title}" is already pending (id: ${t.id}). CC will handle it shortly.` }],
+            };
+          }
+        } catch {}
+      }
+
+      const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const task: Record<string, unknown> = {
+        id,
+        ts: new Date().toISOString(),
+        chatJid,
+        title: args.title,
+        body: args.body,
+      };
+      if (args.triggerMessageId !== undefined) {
+        task.triggerMessageId = args.triggerMessageId;
+      }
+      const tempPath = path.join(CC_INBOX_DIR, `${id}.task.tmp`);
+      const finalPath = path.join(CC_INBOX_DIR, `${id}.task`);
+      fs.writeFileSync(tempPath, JSON.stringify(task, null, 2));
+      fs.renameSync(tempPath, finalPath);
+      return {
+        content: [{ type: 'text' as const, text: `Task sent to CC (id: ${id}). CC will reply to this chat when done.` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Failed to send task to CC: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'send_reaction',
+  "React to a Telegram message with an emoji instead of sending a text acknowledgement. Use 👍 to acknowledge CC messages, ✅ when confirming something works, ⏳ when starting a long task, ❌ when something failed. Prefer reactions over text for brief acknowledgements.",
+  {
+    message_id: z.number().describe('Telegram message_id to react to — use the integer id= attribute from a <message> tag in the conversation (e.g. 1390). Only user messages have integer ids. Never use bot message ids like "bot-..." or numeric timestamps.'),
+    emoji: z.string().describe('Reaction emoji (e.g. "👍", "✅", "⏳", "❌")'),
+  },
+  async (args) => {
+    const data = {
+      type: 'reaction',
+      chatJid,
+      messageId: args.message_id,
+      emoji: args.emoji,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: `Reaction ${args.emoji} sent.` }] };
   },
 );
 

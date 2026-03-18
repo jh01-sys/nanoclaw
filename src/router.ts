@@ -16,7 +16,10 @@ export function formatMessages(
 ): string {
   const lines = messages.map((m) => {
     const displayTime = formatLocalTime(m.timestamp, timezone);
-    return `<message sender="${escapeXml(m.sender_name)}" time="${escapeXml(displayTime)}">${escapeXml(m.content)}</message>`;
+    // Include id only for numeric Telegram message_ids (user messages).
+    // Bot message ids like "bot-..." are omitted to avoid confusion.
+    const idAttr = /^\d+$/.test(m.id) ? ` id="${m.id}"` : '';
+    return `<message${idAttr} sender="${escapeXml(m.sender_name)}" time="${escapeXml(displayTime)}">${escapeXml(m.content)}</message>`;
   });
 
   const header = `<context timezone="${escapeXml(timezone)}" />\n`;
@@ -29,9 +32,12 @@ export function stripInternalTags(text: string): string {
 }
 
 export function formatOutbound(rawText: string): string {
-  const text = stripInternalTags(rawText);
+  let text = stripInternalTags(rawText);
   if (!text) return '';
-  return text;
+  // Strip the SDK's hardcoded model signature line (e.g. "🤖 Claude Sonnet 4.6 (Anthropic)")
+  // Our own model tag from modelUsage (e.g. "🤖 claude-haiku-4-5") is kept.
+  text = text.replace(/\n?🤖 Claude [^\n]+\(Anthropic\)\s*/g, '');
+  return text.trim();
 }
 
 export function routeOutbound(

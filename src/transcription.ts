@@ -6,11 +6,12 @@ import path from 'path';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 
-const env = readEnvFile(['WHISPER_BIN', 'WHISPER_MODEL']);
+const env = readEnvFile(['WHISPER_BIN', 'WHISPER_MODEL', 'WHISPER_LANG']);
 const WHISPER_BIN = env.WHISPER_BIN || 'whisper-cli';
 const WHISPER_MODEL =
   env.WHISPER_MODEL ||
   path.join(process.cwd(), 'data', 'models', 'ggml-base.bin');
+const WHISPER_LANG = env.WHISPER_LANG || '';
 
 /**
  * Transcribe an audio buffer using local whisper.cpp.
@@ -43,14 +44,18 @@ export async function transcribeAudio(
     ]);
 
     // Run whisper-cli
-    const transcript = await exec(WHISPER_BIN, [
+    const whisperArgs = [
       '-m',
       WHISPER_MODEL,
       '-f',
       wavPath,
       '--no-timestamps',
       '-nt', // no_prints — suppress everything except the transcript
-    ]);
+    ];
+    if (WHISPER_LANG) {
+      whisperArgs.push('-l', WHISPER_LANG);
+    }
+    const transcript = await exec(WHISPER_BIN, whisperArgs);
 
     const text = transcript.trim();
     if (!text) return null;

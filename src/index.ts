@@ -41,9 +41,10 @@ import {
   setSession,
   storeChatMetadata,
   storeMessage,
+  storeMessageDirect,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
-import { resolveGroupFolderPath } from './group-folder.js';
+import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
@@ -57,6 +58,16 @@ import {
   loadSenderAllowlist,
   shouldDropMessage,
 } from './sender-allowlist.js';
+import {
+  startCcBridge,
+  handleCcConfirmationReply,
+  createCcTaskFromMessage,
+} from './cc-bridge.js';
+import { startCcWorker } from './cc-worker.js';
+import { readEnvFile } from './env.js';
+import { isDevCommand, handleDevCommand } from './dev-commands.js';
+import { initHueScheduler } from './hue-scheduler.js';
+import { resolveModel } from './model-router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -64,11 +75,65 @@ import { logger } from './logger.js';
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
 
+/**
+ * Check if a message is a reply to a pending 🔴 confirmation request.
+ * Scans the group's IPC confirm directory for pending .request files.
+ * If found and the message is YES/NO, writes the .response file.
+ * Returns true if the message was consumed as a confirmation reply.
+ */
+function handleConfirmationReply(chatJid: string, content: string): boolean {
+  const group = registeredGroups[chatJid];
+  if (!group) return false;
+
+  const confirmDir = path.join(resolveGroupIpcPath(group.folder), 'confirm');
+  if (!fs.existsSync(confirmDir)) return false;
+
+  // Find pending confirmation requests
+  let requestFiles: string[];
+  try {
+    requestFiles = fs
+      .readdirSync(confirmDir)
+      .filter((f) => f.endsWith('.request'));
+  } catch {
+    return false;
+  }
+
+  if (requestFiles.length === 0) return false;
+
+  // Use the most recent pending request
+  const latestRequest = requestFiles.sort().pop()!;
+  const confirmId = latestRequest.replace('.request', '');
+  const trimmed = content.trim().toUpperCase();
+  const confirmed = trimmed === 'YES';
+
+  // Only consume if it's a clear YES or NO/cancel
+  if (trimmed !== 'YES' && trimmed !== 'NO' && trimmed !== 'CANCEL')
+    return false;
+
+  const responsePath = path.join(confirmDir, `${confirmId}.response`);
+  fs.writeFileSync(responsePath, JSON.stringify({ confirmed }));
+  logger.info(
+    { confirmId, confirmed, chatJid },
+    `Risk confirmation ${confirmed ? 'approved' : 'denied'}`,
+  );
+  return true;
+}
+
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+
+/** Matches messages Jake directs to CC: "CC: ..." or "CC, ..." */
+const CC_DIRECTED_RE = /^cc[,:\s]/i;
+function isCcDirected(msg: NewMessage): boolean {
+  return (
+    !msg.is_from_me &&
+    !msg.is_bot_message &&
+    CC_DIRECTED_RE.test(msg.content.trim())
+  );
+}
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -180,10 +245,39 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
-  const prompt = formatMessages(missedMessages, TIMEZONE);
+  // For main groups, intercept CC-directed messages and route to CC instead of Annie
+  let messagesToProcess = missedMessages;
+  if (isMainGroup) {
+    const ccMessages = missedMessages.filter(isCcDirected);
+    const regularMessages = missedMessages.filter((m) => !isCcDirected(m));
+    for (const m of ccMessages) {
+      createCcTaskFromMessage(m.content, chatJid, m.id, 'jake');
+    }
+    if (regularMessages.length === 0) {
+      // Only CC-directed messages — advance cursor and return without invoking Annie
+      lastAgentTimestamp[chatJid] =
+        missedMessages[missedMessages.length - 1].timestamp;
+      saveState();
+      return true;
+    }
+    messagesToProcess = regularMessages;
+  }
 
-  // Advance cursor so the piping path in startMessageLoop won't re-fetch
-  // these messages. Save the old cursor so we can roll back on error.
+  const basePrompt = formatMessages(messagesToProcess, TIMEZONE);
+
+  // Inject mandatory CC communication rules into every prompt — code-enforced,
+  // not relying on CLAUDE.md rule-following alone.
+  const hasCcMessage = missedMessages.some((m) => m.sender === 'CC');
+  const ccReminder = hasCcMessage
+    ? `[SYSTEM REMINDER: A message from CC is in this context.\n` +
+      `(1) Your FIRST action MUST be mcp__nanoclaw__send_message with a brief acknowledgement like "On it." — before ANY other tool call.\n` +
+      `(2) To reach CC: call cc_send_task. Writing "CC, ..." or "CC should ..." in your reply goes nowhere — CC cannot read the chat.]\n\n`
+    : `[REMINDER: To send any work to CC, you MUST call cc_send_task. ` +
+      `Writing "CC should ..." or "CC, ..." in your reply is silently lost — CC never sees it.]\n\n`;
+  const prompt = ccReminder + basePrompt;
+
+  // Advance cursor past ALL messages (incl. CC-directed ones).
+  // Save old cursor so we can roll back on error.
   const previousCursor = lastAgentTimestamp[chatJid] || '';
   lastAgentTimestamp[chatJid] =
     missedMessages[missedMessages.length - 1].timestamp;
@@ -211,6 +305,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
+  let hadSuccess = false; // true if any result with status=success was received
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
@@ -219,11 +314,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         typeof result.result === 'string'
           ? result.result
           : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+      const text = formatOutbound(raw);
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
+
       if (text) {
-        await channel.sendMessage(chatJid, text);
+        const outbound = `🤖 *${ASSISTANT_NAME}:* ${text}`;
+        await channel.sendMessage(chatJid, outbound);
+        storeMessageDirect({
+          id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          chat_jid: chatJid,
+          sender: ASSISTANT_NAME,
+          sender_name: ASSISTANT_NAME,
+          content: outbound,
+          timestamp: new Date().toISOString(),
+          is_from_me: true,
+          is_bot_message: true,
+        });
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -232,6 +338,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
     if (result.status === 'success') {
       queue.notifyIdle(chatJid);
+      hadSuccess = true;
     }
 
     if (result.status === 'error') {
@@ -243,12 +350,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
-    // If we already sent output to the user, don't roll back the cursor —
-    // the user got their response and re-processing would send duplicates.
-    if (outputSentToUser) {
+    // If we already sent output to the user, or the agent completed successfully
+    // (even with result: null), don't roll back the cursor — the messages were
+    // processed and rolling back would cause duplicate processing.
+    if (outputSentToUser || hadSuccess) {
       logger.warn(
-        { group: group.name },
-        'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
+        { group: group.name, outputSentToUser, hadSuccess },
+        'Agent error after successful processing, skipping cursor rollback to prevent duplicates',
       );
       return true;
     }
@@ -416,17 +524,44 @@ async function startMessageLoop(): Promise<void> {
             lastAgentTimestamp[chatJid] || '',
             ASSISTANT_NAME,
           );
-          const messagesToSend =
+          const pendingMessages =
             allPending.length > 0 ? allPending : groupMessages;
+
+          // For main groups, intercept CC-directed messages and route to CC instead of Annie
+          let messagesToSend = pendingMessages;
+          if (isMainGroup) {
+            const ccMessages = pendingMessages.filter(isCcDirected);
+            const regularMessages = pendingMessages.filter(
+              (m) => !isCcDirected(m),
+            );
+            for (const m of ccMessages) {
+              createCcTaskFromMessage(m.content, chatJid, m.id, 'jake');
+            }
+            if (regularMessages.length === 0 && ccMessages.length > 0) {
+              // All messages were CC-directed — advance cursor and skip Annie
+              lastAgentTimestamp[chatJid] =
+                pendingMessages[pendingMessages.length - 1].timestamp;
+              saveState();
+              continue;
+            }
+            if (regularMessages.length < pendingMessages.length) {
+              messagesToSend = regularMessages;
+            }
+          }
+
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
-          if (queue.sendMessage(chatJid, formatted)) {
+          // Classify model for the follow-up message
+          const userContent = messagesToSend.map((m) => m.content).join(' ');
+          const followUpModel = resolveModel(userContent);
+          if (queue.sendMessage(chatJid, formatted, followUpModel)) {
             logger.debug(
               { chatJid, count: messagesToSend.length },
               'Piped messages to active container',
             );
+            // Advance cursor past ALL pending messages (including CC-directed ones)
             lastAgentTimestamp[chatJid] =
-              messagesToSend[messagesToSend.length - 1].timestamp;
+              pendingMessages[pendingMessages.length - 1].timestamp;
             saveState();
             // Show typing indicator while the container processes the piped message
             channel
@@ -548,6 +683,40 @@ async function main(): Promise<void> {
         return;
       }
 
+      // Dev commands — intercept before agent, main group + allowed senders only
+      if (isDevCommand(trimmed) && registeredGroups[chatJid]?.isMain) {
+        const cfg = loadSenderAllowlist();
+        if (msg.is_from_me || isSenderAllowed(chatJid, msg.sender, cfg)) {
+          const channel = findChannel(channels, chatJid);
+          if (channel) {
+            handleDevCommand(trimmed)
+              .then((reply) => channel.sendMessage(chatJid, `⚙️ ${reply}`))
+              .catch((err) =>
+                logger.error({ err, chatJid }, 'Dev command error'),
+              );
+          }
+          return;
+        }
+      }
+
+      // Check if this is a CC bridge confirmation reply (from Dev group)
+      const devGroupJid = readEnvFile(['CC_BRIDGE_JID']).CC_BRIDGE_JID;
+      if (devGroupJid && chatJid === devGroupJid) {
+        const channel = findChannel(channels, chatJid);
+        if (
+          handleCcConfirmationReply(msg.content, (text) => {
+            channel?.sendMessage(chatJid, text).catch(() => {});
+          })
+        ) {
+          return; // Consumed as CC confirmation, don't process further
+        }
+      }
+
+      // Check if this is a reply to a pending 🔴 confirmation request
+      if (handleConfirmationReply(chatJid, msg.content)) {
+        return; // Consumed as confirmation reply, don't store or process further
+      }
+
       // Sender allowlist drop mode: discard messages from denied senders before storing
       if (!msg.is_from_me && !msg.is_bot_message && registeredGroups[chatJid]) {
         const cfg = loadSenderAllowlist();
@@ -597,7 +766,61 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Start CC bridge (forwards Claude Code tool events to Dev group via Telegram)
+  startCcBridge({
+    sendMessage: async (jid, text) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) {
+        logger.warn({ jid }, 'CC bridge: no channel for Dev group JID');
+        return;
+      }
+      await channel.sendMessage(jid, text);
+    },
+    devGroupJid: () => readEnvFile(['CC_BRIDGE_JID']).CC_BRIDGE_JID || null,
+    storeCcMessage: (chatJid, text) => {
+      storeMessageDirect({
+        id: `cc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        chat_jid: chatJid,
+        sender: 'CC',
+        sender_name: 'CC',
+        content: text,
+        timestamp: new Date().toISOString(),
+        is_from_me: true,
+        is_bot_message: true,
+      });
+    },
+    triggerChat: (chatJid) => queue.enqueueMessageCheck(chatJid),
+  });
+
+  // Start CC worker — auto-spawns Claude sessions when Annie sends tasks
+  startCcWorker({
+    devGroupJid: () => readEnvFile(['CC_BRIDGE_JID']).CC_BRIDGE_JID || null,
+    sendMessage: async (jid, text) => {
+      const channel = findChannel(channels, jid);
+      await channel?.sendMessage(jid, text);
+    },
+    storeCcMessage: (chatJid, text) => {
+      storeMessageDirect({
+        id: `cc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        chat_jid: chatJid,
+        sender: 'CC',
+        sender_name: 'CC',
+        content: text,
+        timestamp: new Date().toISOString(),
+        is_from_me: true,
+        is_bot_message: true,
+      });
+    },
+    sendReaction: async (jid, messageId, emoji) => {
+      const channel = findChannel(channels, jid);
+      if (channel && 'sendReaction' in channel) {
+        await (channel as any).sendReaction(jid, messageId, emoji);
+      }
+    },
+  });
+
   // Start subsystems (independently of connection handler)
+  initHueScheduler();
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,
@@ -611,7 +834,8 @@ async function main(): Promise<void> {
         return;
       }
       const text = formatOutbound(rawText);
-      if (text) await channel.sendMessage(jid, text);
+      if (text)
+        await channel.sendMessage(jid, `🤖 *${ASSISTANT_NAME}:* ${text}`);
     },
   });
   startIpcWatcher({
@@ -619,6 +843,12 @@ async function main(): Promise<void> {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       return channel.sendMessage(jid, text);
+    },
+    sendReaction: async (jid, messageId, emoji) => {
+      const channel = findChannel(channels, jid);
+      if (channel && 'sendReaction' in channel) {
+        await (channel as any).sendReaction(jid, messageId, emoji);
+      }
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
@@ -635,6 +865,19 @@ async function main(): Promise<void> {
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
+
+  // Startup notification — lets the user know the service is back after a restart
+  const mainEntry = Object.entries(registeredGroups).find(([, g]) => g.isMain);
+  if (mainEntry) {
+    const [mainJid] = mainEntry;
+    const mainChannel = findChannel(channels, mainJid);
+    mainChannel
+      ?.sendMessage(mainJid, `⚙️ *NanoClaw:* ✅ Back online`)
+      .catch((err) =>
+        logger.warn({ err }, 'Failed to send startup notification'),
+      );
+  }
+
   startMessageLoop().catch((err) => {
     logger.fatal({ err }, 'Message loop crashed unexpectedly');
     process.exit(1);

@@ -66,7 +66,19 @@ export class GroupQueue {
 
     if (state.active) {
       state.pendingMessages = true;
-      logger.debug({ groupJid }, 'Container active, message queued');
+      // If the container is idle-waiting (done with work, holding open for IPC),
+      // close it immediately so the pending message is processed without delay.
+      // This is critical for CC→Annie message delivery (CC messages don't go through
+      // the message loop, so triggerChat is the only delivery path).
+      if (state.idleWaiting) {
+        logger.debug(
+          { groupJid },
+          'Container idle-waiting, closing to process pending CC message',
+        );
+        this.closeStdin(groupJid);
+      } else {
+        logger.debug({ groupJid }, 'Container active, message queued');
+      }
       return;
     }
 
@@ -157,11 +169,21 @@ export class GroupQueue {
    * Send a follow-up message to the active container via IPC file.
    * Returns true if the message was written, false if no active container.
    */
-  sendMessage(groupJid: string, text: string): boolean {
+  sendMessage(groupJid: string, text: string, model?: string): boolean {
     const state = this.getGroup(groupJid);
     if (!state.active || !state.groupFolder || state.isTaskContainer)
       return false;
     state.idleWaiting = false; // Agent is about to receive work, no longer idle
+
+    // Update model file so agent-runner uses the right model for this message
+    if (model) {
+      const modelPath = path.join(DATA_DIR, 'ipc', state.groupFolder, 'model');
+      try {
+        fs.writeFileSync(modelPath, model);
+      } catch {
+        /* ignore */
+      }
+    }
 
     const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
     try {
